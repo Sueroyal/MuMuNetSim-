@@ -1,0 +1,3 @@
+[submodule "third_party/clumsy"]
+	path = third_party/clumsy
+	url = https://github.com/jagt/clumsy.git
