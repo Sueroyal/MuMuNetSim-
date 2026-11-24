@@ -1,4 +1,4 @@
-// MuMuNetSim - MuMu 模拟器弱网 / 断网模拟器（单文件 WinForms）
+﻿// MuMuNetSim - MuMu 模拟器弱网 / 断网模拟器（单文件 WinForms）
 // 编译：powershell -File build.ps1
 using System;
 using System.Collections.Concurrent;
@@ -43,6 +43,7 @@ namespace MuMuNetSim
 
         public static string MuMuManagerPath;
         public static string ClumsyPath;
+        public static string PhoneIp = "";
 
         // 每实例配置：预设 / 延迟 ms / 上行 / 下行
         public static readonly Dictionary<string, string> Presets = new Dictionary<string, string>();
@@ -69,6 +70,7 @@ namespace MuMuNetSim
                     var v = line.Substring(i + 1).Trim();
                     if (string.Equals(k, "clumsy", StringComparison.OrdinalIgnoreCase)) ClumsyPath = v;
                     else if (string.Equals(k, "mumumanager", StringComparison.OrdinalIgnoreCase)) MuMuManagerPath = v;
+                    else if (string.Equals(k, "phone.ip", StringComparison.OrdinalIgnoreCase)) PhoneIp = v;
                     else if (k.StartsWith("preset.", StringComparison.OrdinalIgnoreCase)) Presets[k.Substring(7)] = v;
                     else if (k.StartsWith("delay.", StringComparison.OrdinalIgnoreCase)) { int ms; if (int.TryParse(v, out ms)) Delays[k.Substring(6)] = ms; }
                     else if (k.StartsWith("up.", StringComparison.OrdinalIgnoreCase)) Ups[k.Substring(3)] = (v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase));
@@ -85,6 +87,7 @@ namespace MuMuNetSim
                 var sb = new StringBuilder();
                 sb.AppendLine("clumsy=" + (ClumsyPath ?? ""));
                 sb.AppendLine("mumumanager=" + (MuMuManagerPath ?? ""));
+                if (!string.IsNullOrEmpty(PhoneIp)) sb.AppendLine("phone.ip=" + PhoneIp);
                 foreach (var kv in Presets) sb.AppendLine("preset." + kv.Key + "=" + kv.Value);
                 foreach (var kv in Delays) sb.AppendLine("delay." + kv.Key + "=" + kv.Value);
                 foreach (var kv in Ups) sb.AppendLine("up." + kv.Key + "=" + (kv.Value ? "1" : "0"));
@@ -674,6 +677,145 @@ namespace MuMuNetSim
         }
     }
 
+    public class PhoneInfo
+    {
+        public string Serial = "";
+        public bool Connected;
+        public string Model = "", Android = "", RootState = "未知";
+        public bool Root;
+        public bool NeedSu;        // true: 用 su -c 提权；false: adb shell 本身就是 root
+        public int AdbPort = 5555;
+        public string Applied = "";
+    }
+
+    public static class Phone
+    {
+        const string OUT_CHAIN = "MT_OUT";   // 手机端专用链，方便一键清空
+
+        public static string AdbPath()
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(App.MuMuManagerPath ?? "");
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    var p = Path.Combine(dir, "adb.exe");
+                    if (File.Exists(p)) return p;
+                }
+            }
+            catch { }
+            return "adb";
+        }
+
+        static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
+        static string Run(string args, int timeoutMs) { return Proc.Run(AdbPath(), args, timeoutMs); }
+
+        public static bool Connect(string serial)
+        {
+            var o = Run("connect " + serial, 20000);
+            return !o.Contains("failed") && !o.Contains("cannot") && !o.StartsWith("<ERROR");
+        }
+
+        public static void Disconnect(string serial) { Run("disconnect " + serial, 8000); }
+
+        public static List<string> Devices()
+        {
+            var list = new List<string>();
+            var o = Run("devices", 8000);
+            foreach (var line in o.Split('\n'))
+            {
+                var t = line.Trim();
+                if (t.Length == 0 || t.StartsWith("List of")) continue;
+                if (t.Contains("\tdevice") || t.EndsWith(" device")) list.Add(t.Split('\t')[0].Trim());
+            }
+            return list;
+        }
+
+        public static string Shell(string serial, string cmd) { return Run("-s " + serial + " shell " + Q(cmd), 20000); }
+        public static string ShellSu(string serial, string cmd) { return Run("-s " + serial + " shell " + Q("su -c '" + (cmd ?? "").Replace("'", "") + "'"), 25000); }
+
+        // 按设备能力选择提权方式
+        public static string ShellRun(PhoneInfo p, string cmd)
+        {
+            return p.NeedSu ? ShellSu(p.Serial, cmd) : Shell(p.Serial, cmd);
+        }
+
+        public static PhoneInfo Probe(string serial)
+        {
+            var info = new PhoneInfo();
+            info.Serial = serial;
+            var parts = serial.Split(':');
+            if (parts.Length > 1) { int port; if (int.TryParse(parts[parts.Length - 1], out port)) info.AdbPort = port; }
+
+            var devs = Devices();
+            info.Connected = devs.Any(d => string.Equals(d, serial, StringComparison.OrdinalIgnoreCase));
+            if (!info.Connected) return info;
+
+            info.Model = Shell(serial, "getprop ro.product.model").Trim();
+            info.Android = Shell(serial, "getprop ro.build.version.release").Trim();
+            var id = Shell(serial, "id").Trim();
+            if (id.Contains("uid=0"))
+            {
+                info.Root = true; info.NeedSu = false; info.RootState = "是（adb shell 直接 root）";
+            }
+            else
+            {
+                var suId = ShellSu(serial, "id").Trim();
+                info.Root = suId.Contains("uid=0");
+                info.NeedSu = true;
+                info.RootState = info.Root ? "是（su）" : "否（不支持 su）";
+            }
+            return info;
+        }
+
+        // 手机端用独立链，便于清空；命令里不出现引号，避免多层转义
+        public static string ApplyPreset(PhoneInfo p, string preset)
+        {
+            string key = (preset ?? "normal").ToLowerInvariant();
+            int adbPort = p.AdbPort > 0 ? p.AdbPort : 5555;
+            var sb = new StringBuilder();
+            sb.Append("iptables -N " + OUT_CHAIN + " 2>/dev/null; ");
+            sb.Append("iptables -F " + OUT_CHAIN + " 2>/dev/null; ");
+            sb.Append("iptables -A " + OUT_CHAIN + " -o lo -j ACCEPT; ");
+            sb.Append("iptables -A " + OUT_CHAIN + " -p tcp --sport " + adbPort + " -j ACCEPT; ");
+
+            string desc;
+            if (key == "offline")
+            {
+                sb.Append("iptables -A " + OUT_CHAIN + " -j DROP; ");
+                desc = "断网";
+            }
+            else if (key.StartsWith("loss"))
+            {
+                int pct;
+                if (!int.TryParse(key.Substring(4), out pct)) pct = 0;
+                if (pct <= 0) return Clear(p);
+                var prob = (pct / 100.0).ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                sb.Append("iptables -A " + OUT_CHAIN + " -m statistic --mode random --probability " + prob + " -j DROP; ");
+                desc = "丢包 " + pct + "%";
+            }
+            else return Clear(p);
+
+            sb.Append("iptables -C OUTPUT -j " + OUT_CHAIN + " 2>/dev/null || iptables -I OUTPUT 1 -j " + OUT_CHAIN);
+            var outp = ShellRun(p, sb.ToString());
+            if (outp.Contains("Permission denied") || outp.Contains("not found") || outp.Contains("error"))
+                throw new Exception(outp.Trim());
+            p.Applied = desc;
+            return desc;
+        }
+
+        public static string Clear(PhoneInfo p)
+        {
+            string cmd = "iptables -F " + OUT_CHAIN + " 2>/dev/null; " +
+                         "iptables -D OUTPUT -j " + OUT_CHAIN + " 2>/dev/null; " +
+                         "iptables -D OUTPUT -j " + OUT_CHAIN + " 2>/dev/null; " +
+                         "iptables -X " + OUT_CHAIN + " 2>/dev/null; true";
+            try { ShellRun(p, cmd); } catch { }
+            p.Applied = "正常";
+            return "正常";
+        }
+    }
+
     public static class Presets
     {
         // 丢包档位：15~100（步长 10，末档 100% 即全丢）
@@ -722,6 +864,26 @@ namespace MuMuNetSim
                     sb.AppendLine("WinDivert=" + (WinDivertNative.DllDir ?? App.FindWinDivertDir() ?? "未找到"));
                     sb.AppendLine("日志=" + App.LogPath);
                     Console.WriteLine(sb.ToString());
+                    File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8);
+                    return 0;
+                }
+                if (args.Length > 0 && args[0].Equals("/phone", StringComparison.OrdinalIgnoreCase))
+                {
+                    string serial = "", preset = "normal";
+                    for (int i = 0; i < args.Length; i++)
+                    {
+                        if (args[i].Equals("/ip", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) serial = args[i + 1];
+                        if (args[i].Equals("/preset", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) preset = args[i + 1].ToLowerInvariant();
+                    }
+                    if (serial.Length == 0) { sb.AppendLine("用法：/phone /ip 192.168.1.50:5555 /preset loss45|offline|normal"); Console.WriteLine(sb); return 2; }
+                    if (!serial.Contains(":")) serial += ":5555";
+                    Phone.Connect(serial);
+                    var info = Phone.Probe(serial);
+                    sb.AppendLine("设备 " + info.Serial + "  连接=" + info.Connected + "  型号=" + info.Model + "  Android=" + info.Android + "  root=" + info.RootState);
+                    if (!info.Connected) { Console.WriteLine(sb); File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8); return 3; }
+                    if (!info.Root) { sb.AppendLine("没有 root，无法下发 iptables"); Console.WriteLine(sb); File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8); return 4; }
+                    sb.AppendLine("结果：" + Phone.ApplyPreset(info, preset));
+                    Console.WriteLine(sb);
                     File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8);
                     return 0;
                 }
@@ -843,6 +1005,12 @@ namespace MuMuNetSim
         Label lblStatus;
         Button btnRefresh, btnAllNormal;
         CheckBox chkClumsy;
+        TextBox txtPhoneIp;
+        Label lblPhoneStatus;
+        ComboBox cmbPhonePreset;
+        Button btnPhoneConnect, btnPhoneDisconnect, btnPhoneApply, btnPhoneNormal;
+        PhoneInfo _phone;
+        DateTime _phoneProbeAt = DateTime.MinValue;
         System.Windows.Forms.Timer timer;
 
         readonly ConcurrentDictionary<int, string> _applied = new ConcurrentDictionary<int, string>();
@@ -866,6 +1034,15 @@ namespace MuMuNetSim
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9f);
             try { var cp = App.FindClumsy(); if (cp != null) Icon = Icon.ExtractAssociatedIcon(cp); } catch { }
+
+            var tabs = new TabControl();
+            tabs.SetBounds(6, 6, 868, 446);
+            tabs.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            var tab1 = new TabPage("MuMu 实例");
+            var tab2 = new TabPage("手机 / 局域网设备");
+            tabs.TabPages.Add(tab1);
+            tabs.TabPages.Add(tab2);
+            Controls.Add(tabs);
 
             var lblTop = new Label();
             lblTop.Text = "每实例单独预设：断网 / 丢包档位 / 延迟(ms，可分别只做上行或下行)；实例启动后自动套用";
@@ -951,6 +1128,93 @@ namespace MuMuNetSim
             txtLog.BackColor = Color.FromArgb(250, 250, 250);
             Controls.Add(txtLog);
 
+            // ---- 把上面的实例相关控件挪进「MuMu 实例」页，并把日志留在外面共用 ----
+            foreach (var c in new Control[] { lblTop, btnRefresh, btnAllNormal, chkClumsy, lblStatus, grid })
+            {
+                Controls.Remove(c);
+                tab1.Controls.Add(c);
+            }
+            lblTop.SetBounds(8, 6, 830, 20);
+            btnRefresh.SetBounds(8, 30, 92, 26);
+            btnAllNormal.SetBounds(106, 30, 110, 26);
+            chkClumsy.SetBounds(226, 33, 520, 22);
+            lblStatus.SetBounds(742, 33, 110, 22);
+            grid.SetBounds(8, 62, 844, 344);
+            lblLog.SetBounds(14, 458, 60, 20);
+            txtLog.SetBounds(14, 478, 852, 124);
+
+            // ---- 手机 / 局域网设备页 ----
+            var lblP1 = new Label();
+            lblP1.Text = "设备 IP:端口（需开无线调试）：";
+            lblP1.SetBounds(12, 16, 200, 22);
+            tab2.Controls.Add(lblP1);
+
+            txtPhoneIp = new TextBox();
+            txtPhoneIp.Text = GetPhoneIp();
+            txtPhoneIp.SetBounds(214, 12, 190, 24);
+            tab2.Controls.Add(txtPhoneIp);
+
+            btnPhoneConnect = new Button();
+            btnPhoneConnect.Text = "连接";
+            btnPhoneConnect.SetBounds(414, 11, 78, 26);
+            btnPhoneConnect.Click += delegate { PhoneConnect(); };
+            tab2.Controls.Add(btnPhoneConnect);
+
+            btnPhoneDisconnect = new Button();
+            btnPhoneDisconnect.Text = "断开";
+            btnPhoneDisconnect.SetBounds(498, 11, 78, 26);
+            btnPhoneDisconnect.Click += delegate { PhoneDisconnect(); };
+            tab2.Controls.Add(btnPhoneDisconnect);
+
+            lblPhoneStatus = new Label();
+            lblPhoneStatus.SetBounds(12, 46, 830, 56);
+            lblPhoneStatus.Text = "未连接。手机先：设置 → 开发者选项 → 无线调试（或 USB 调试 + adb tcpip 5555），确保与本机同一局域网。";
+            lblPhoneStatus.ForeColor = Color.DimGray;
+            tab2.Controls.Add(lblPhoneStatus);
+
+            var lblP2 = new Label();
+            lblP2.Text = "预设环境：";
+            lblP2.SetBounds(12, 114, 80, 22);
+            lblP2.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
+            tab2.Controls.Add(lblP2);
+
+            cmbPhonePreset = new ComboBox();
+            cmbPhonePreset.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbPhonePreset.SetBounds(98, 110, 190, 26);
+            cmbPhonePreset.Items.AddRange(Presets.Names);
+            cmbPhonePreset.SelectedIndex = 0;
+            tab2.Controls.Add(cmbPhonePreset);
+
+            btnPhoneApply = new Button();
+            btnPhoneApply.Text = "应用到手机";
+            btnPhoneApply.SetBounds(298, 109, 104, 28);
+            btnPhoneApply.Click += delegate { PhoneApply(); };
+            tab2.Controls.Add(btnPhoneApply);
+
+            btnPhoneNormal = new Button();
+            btnPhoneNormal.Text = "恢复正常";
+            btnPhoneNormal.SetBounds(408, 109, 90, 28);
+            btnPhoneNormal.Click += delegate { PhoneNormal(); };
+            tab2.Controls.Add(btnPhoneNormal);
+
+            var lblPHint = new Label();
+            lblPHint.SetBounds(12, 150, 830, 250);
+            lblPHint.ForeColor = Color.DimGray;
+            lblPHint.Text =
+                "手机端的弱网/断网是在手机内部下发 iptables 规则实现的（和 MuMu 实例一样的做法），\r\n" +
+                "因此：\r\n" +
+                "  1. 手机需要 root（adb shell su 可用）。没有 root 时本页只能看连接状态，无法改网络。\r\n" +
+                "  2. 支持：丢包档位（15%~100%）、断网。会一直放行 adb 端口，所以随时能点「恢复正常」。\r\n" +
+                "  3. 不支持延迟：手机的流量不经过本机，宿主机侧的抓包引擎碰不到它；\r\n" +
+                "     想要延迟可以把手机连到本机开的移动热点上，再用「MuMu 实例」页的全局弱网（clumsy）。\r\n" +
+                "  4. 恢复方式：点「恢复正常」，或重启手机（规则不落盘）。\r\n" +
+                "\r\n" +
+                "连接步骤（手机与电脑同一 Wi-Fi）：\r\n" +
+                "  Android 11+：开发者选项 → 无线调试 → 使用配对码配对设备（首次）→ 无线调试页能看到 IP:端口\r\n" +
+                "  其它版本：USB 连线后执行  adb tcpip 5555  再拔线，用 手机IP:5555 连接\r\n" +
+                "  手机弹出「允许 USB 调试」时点允许。";
+            tab2.Controls.Add(lblPHint);
+
             timer = new System.Windows.Forms.Timer();
             timer.Interval = 2000;
             timer.Tick += delegate { PollOnce(false); };
@@ -987,6 +1251,7 @@ namespace MuMuNetSim
                     var l = insts;
                     Ui(delegate() { UpdateGrid(l); });
                     SyncAll(l);
+                    RefreshPhone();
                 }
                 _pollBusy = false;
             });
@@ -1304,6 +1569,134 @@ namespace MuMuNetSim
             th.Start();
         }
 
+        // ------------------------------------------------------------ 手机 / 局域网设备
+
+        string GetPhoneIp() { return App.PhoneIp ?? ""; }
+
+        static string PhoneStatusText(PhoneInfo p)
+        {
+            if (p == null) return "未连接。";
+            if (!p.Connected) return "未连接（" + p.Serial + "）。检查：手机与电脑同一 Wi-Fi、已开无线调试、手机上点了「允许调试」。";
+            return "已连接：" + p.Serial + "　型号 " + p.Model + "　Android " + p.Android + "　root：" + p.RootState;
+        }
+
+        void PhoneConnect()
+        {
+            string ip = (txtPhoneIp.Text ?? "").Trim();
+            if (ip.Length == 0) { Log("请填设备 IP:端口，例如 192.168.1.50:5555"); return; }
+            if (!ip.Contains(":")) ip += ":5555";
+            App.PhoneIp = ip; App.SaveIni();
+            Log("连接手机 " + ip + " …");
+            var th = new Thread(delegate()
+            {
+                try
+                {
+                    bool ok = Phone.Connect(ip);
+                    var info = Phone.Probe(ip);
+                    _phone = info;
+                    _phoneProbeAt = DateTime.Now;
+                    Ui(delegate()
+                    {
+                        lblPhoneStatus.Text = PhoneStatusText(info);
+                        lblPhoneStatus.ForeColor = info.Connected ? Color.Green : Color.Firebrick;
+                    });
+                    UiLog(PhoneStatusText(info) + (ok ? "" : "（adb connect 返回异常，请检查端口/调试授权）"));
+                }
+                catch (Exception ex) { UiLog("连接失败：" + ex.Message); }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void PhoneDisconnect()
+        {
+            var p = _phone;
+            if (p == null) { Log("还没连接"); return; }
+            var th = new Thread(delegate()
+            {
+                try { Phone.Clear(p); } catch { }
+                Phone.Disconnect(p.Serial);
+                _phone = null;
+                _phoneProbeAt = DateTime.MinValue;
+                Ui(delegate()
+                {
+                    lblPhoneStatus.Text = "已断开（已尝试清除手机上的规则）";
+                    lblPhoneStatus.ForeColor = Color.DimGray;
+                });
+                UiLog("已断开 " + p.Serial);
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void PhoneApply()
+        {
+            var p = _phone;
+            if (p == null || !p.Connected) { Log("先在「手机 / 局域网设备」页点「连接」"); return; }
+            if (!p.Root) { Log("该手机没有 root，无法下发 iptables 规则（精确断网/丢包需要 root）"); return; }
+            string preset = Presets.KeyOfName(Convert.ToString(cmbPhonePreset.SelectedItem));
+            var th = new Thread(delegate()
+            {
+                try
+                {
+                    string desc = Phone.ApplyPreset(p, preset);
+                    UiLog("手机 " + p.Serial + " 已套用：" + desc);
+                    UI_PhoneApplied(desc);
+                }
+                catch (Exception ex) { UiLog("手机套用失败：" + ex.Message); }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void PhoneNormal()
+        {
+            var p = _phone;
+            if (p == null) { Log("还没连接"); return; }
+            var th = new Thread(delegate()
+            {
+                try
+                {
+                    Phone.Clear(p);
+                    cmbPhonePreset.SelectedIndex = 0;
+                    UiLog("手机 " + p.Serial + " 已恢复正常");
+                    UI_PhoneApplied("正常");
+                }
+                catch (Exception ex) { UiLog("恢复正常失败：" + ex.Message); }
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void UI_PhoneApplied(string desc)
+        {
+            Ui(delegate()
+            {
+                if (_phone != null && _phone.Connected)
+                    lblPhoneStatus.Text = PhoneStatusText(_phone) + "　已套用：" + desc;
+            });
+        }
+
+        void RefreshPhone()
+        {
+            var p = _phone;
+            if (p == null) return;
+            bool fresh = (DateTime.Now - _phoneProbeAt).TotalSeconds < 8;
+            if (fresh) return;
+            try
+            {
+                var info = Phone.Probe(p.Serial);
+                _phone = info;
+                _phoneProbeAt = DateTime.Now;
+                Ui(delegate()
+                {
+                    lblPhoneStatus.Text = PhoneStatusText(info);
+                    lblPhoneStatus.ForeColor = info.Connected ? Color.Green : Color.Firebrick;
+                });
+            }
+            catch { }
+        }
+
         // ------------------------------------------------------------ UI
 
         void Ui(Action a)
@@ -1348,11 +1741,12 @@ namespace MuMuNetSim
             bool isStatus = args.Length > 0 && args[0].StartsWith("/status", StringComparison.OrdinalIgnoreCase);
             bool isWhere = args.Length > 0 && args[0].StartsWith("/where", StringComparison.OrdinalIgnoreCase);
             bool isPorts = args.Length > 0 && args[0].StartsWith("/ports", StringComparison.OrdinalIgnoreCase);
+            bool isPhone = args.Length > 0 && args[0].StartsWith("/phone", StringComparison.OrdinalIgnoreCase);
             bool isCli = args.Length > 0 && (args[0].StartsWith("/apply", StringComparison.OrdinalIgnoreCase)
-                || args[0].StartsWith("/delay", StringComparison.OrdinalIgnoreCase) || isStatus || isWhere || isPorts);
+                || args[0].StartsWith("/delay", StringComparison.OrdinalIgnoreCase) || isStatus || isWhere || isPorts || isPhone);
 
             // 延迟引擎要用 WinDivert 驱动，必须提权；GUI 也提权一次后 clumsy 才能静默
-            if (!App.IsAdmin() && !noElevate && !isStatus && !isWhere && !isPorts)
+            if (!App.IsAdmin() && !noElevate && !isStatus && !isWhere && !isPorts && !args.Any(a => a.Equals("/noelevate", StringComparison.OrdinalIgnoreCase)) && !isPhone)
             {
                 try
                 {
