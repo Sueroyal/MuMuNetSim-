@@ -38,7 +38,7 @@ namespace MuMuNetSim
     public static class App
     {
         public const string TAG = "mumu-net";
-        public const string TITLE = "MuMu 弱网 / 断网模拟器  v1.3";
+        public const string TITLE = "MuMu 弱网 / 断网模拟器  v1.4";
 
         public static string BaseDir = Path.GetDirectoryName(Application.ExecutablePath);
         public static string IniPath = Path.Combine(BaseDir, "MuMuNetSim.ini");
@@ -47,6 +47,77 @@ namespace MuMuNetSim
         public static string MuMuManagerPath;
         public static string ClumsyPath;
         public static string PhoneIp = "";
+        public static string AssetDir = "";      // 单文件版解包出来的资产目录
+
+        // ---------------------------------------------------------- 单文件版的资源解包
+
+        static readonly string[][] Assets = new string[][] {
+            new string[] { "asset.clumsy.exe",      @"clumsy\clumsy.exe" },
+            new string[] { "asset.WinDivert.dll",   @"clumsy\WinDivert.dll" },
+            new string[] { "asset.WinDivert64.sys", @"clumsy\WinDivert64.sys" },
+            new string[] { "asset.config.txt",      @"clumsy\config.txt" },
+            new string[] { "asset.License.txt",     @"clumsy\License.txt" },
+            new string[] { "asset.readme.txt",      "使用说明.txt" }
+        };
+
+        public static bool DirWritable(string dir)
+        {
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                var probe = Path.Combine(dir, ".wtest_" + Guid.NewGuid().ToString("N").Substring(0, 6));
+                File.WriteAllText(probe, "x");
+                File.Delete(probe);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public static void EnsureAssetsDirForIni()
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(IniPath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            }
+            catch { }
+        }
+
+        public static void EnsureAssets()
+        {            try
+            {
+                var asm = System.Reflection.Assembly.GetExecutingAssembly();
+                var names = asm.GetManifestResourceNames();
+                if (!names.Any(n => n.EndsWith("asset.WinDivert.dll", StringComparison.OrdinalIgnoreCase))) return;  // 不是单文件版
+
+                string home = BaseDir;
+                if (!DirWritable(home))
+                    home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MuMuNetSim");
+                AssetDir = home;
+
+                foreach (var pair in Assets)
+                {
+                    var resName = names.FirstOrDefault(n => n.EndsWith(pair[0], StringComparison.OrdinalIgnoreCase));
+                    if (resName == null) continue;
+                    var target = Path.Combine(home, pair[1]);
+                    var targetDir = Path.GetDirectoryName(target);
+                    if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
+                    // 使用说明只在缺失时写；二进制按大小校验后覆盖
+                    bool skip = File.Exists(target) && pair[1].EndsWith("使用说明.txt", StringComparison.Ordinal);
+                    if (skip) continue;
+                    using (var s = asm.GetManifestResourceStream(resName))
+                    using (var f = File.Create(target))
+                    {
+                        s.CopyTo(f);
+                    }
+                }
+                Log("单文件版：资产已解包到 " + home);
+            }
+            catch (Exception ex)
+            {
+                Log("资产解包失败：" + ex.Message);
+            }
+        }
 
         // 每实例配置：预设 / 延迟 ms / 上行 / 下行
         public static readonly Dictionary<string, string> Presets = new Dictionary<string, string>();
@@ -136,16 +207,20 @@ namespace MuMuNetSim
         public static string FindClumsy()
         {
             if (!string.IsNullOrEmpty(ClumsyPath) && File.Exists(ClumsyPath)) return ClumsyPath;
-            foreach (var c in new[] {
-                Path.Combine(BaseDir, @"clumsy\clumsy.exe"), Path.Combine(BaseDir, "clumsy.exe"),
-                @"D:\clumsy\clumsy.exe", @"C:\clumsy\clumsy.exe" })
-                if (File.Exists(c)) { ClumsyPath = c; return c; }
+            var cands = new List<string>();
+            if (!string.IsNullOrEmpty(AssetDir)) cands.Add(Path.Combine(AssetDir, @"clumsy\clumsy.exe"));
+            cands.Add(Path.Combine(BaseDir, @"clumsy\clumsy.exe"));
+            cands.Add(Path.Combine(BaseDir, "clumsy.exe"));
+            cands.Add(@"D:\clumsy\clumsy.exe");
+            cands.Add(@"C:\clumsy\clumsy.exe");
+            foreach (var c in cands) if (File.Exists(c)) { ClumsyPath = c; return c; }
             return null;
         }
 
         public static string FindWinDivertDir()
         {
             var cands = new List<string>();
+            if (!string.IsNullOrEmpty(AssetDir)) cands.Add(Path.Combine(AssetDir, "clumsy"));
             cands.Add(Path.Combine(BaseDir, "clumsy"));
             cands.Add(BaseDir);
             cands.Add(@"D:\clumsy");
@@ -2199,6 +2274,10 @@ namespace MuMuNetSim
         [STAThread]
         static int Main(string[] args)
         {
+            App.EnsureAssets();                       // 单文件版：先把内置的 clumsy/WinDivert 解出来
+            if (!App.DirWritable(App.BaseDir))
+                App.IniPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MuMuNetSim", "MuMuNetSim.ini");
+            App.EnsureAssetsDirForIni();
             App.LoadIni();
             App.FindMuMuManager();
             App.FindClumsy();
