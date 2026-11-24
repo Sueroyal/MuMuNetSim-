@@ -21,9 +21,9 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("MuMuNetSim")]
 [assembly: System.Reflection.AssemblyProduct("MuMu 弱网 / 断网模拟器")]
 [assembly: System.Reflection.AssemblyDescription("MuMu 模拟器实例 / 局域网手机的弱网、断网、延迟模拟")]
-[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("v1.4")]
+[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.5.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("v1.5")]
 
 namespace MuMuNetSim
 {
@@ -45,7 +45,7 @@ namespace MuMuNetSim
     public static class App
     {
         public const string TAG = "mumu-net";
-        public const string TITLE = "MuMu 弱网 / 断网模拟器  v1.4";
+        public const string TITLE = "MuMu 弱网 / 断网模拟器  v1.5";
 
         public static string BaseDir = Path.GetDirectoryName(Application.ExecutablePath);
         public static string IniPath = Path.Combine(BaseDir, "MuMuNetSim.ini");
@@ -136,6 +136,8 @@ namespace MuMuNetSim
         // 每实例配置：预设 / 延迟 ms / 上行 / 下行
         public static readonly Dictionary<string, string> Presets = new Dictionary<string, string>();
         public static readonly Dictionary<string, int> Delays = new Dictionary<string, int>();
+        public static readonly Dictionary<string, int> Jitters = new Dictionary<string, int>();
+        public static readonly Dictionary<string, int> Limits = new Dictionary<string, int>();
         public static readonly Dictionary<string, bool> Ups = new Dictionary<string, bool>();
         public static readonly Dictionary<string, bool> Downs = new Dictionary<string, bool>();
 
@@ -161,6 +163,8 @@ namespace MuMuNetSim
                     else if (string.Equals(k, "phone.ip", StringComparison.OrdinalIgnoreCase)) PhoneIp = v;
                     else if (k.StartsWith("preset.", StringComparison.OrdinalIgnoreCase)) Presets[k.Substring(7)] = v;
                     else if (k.StartsWith("delay.", StringComparison.OrdinalIgnoreCase)) { int ms; if (int.TryParse(v, out ms)) Delays[k.Substring(6)] = ms; }
+                    else if (k.StartsWith("jitter.", StringComparison.OrdinalIgnoreCase)) { int j; if (int.TryParse(v, out j)) Jitters[k.Substring(7)] = j; }
+                    else if (k.StartsWith("limit.", StringComparison.OrdinalIgnoreCase)) { int l; if (int.TryParse(v, out l)) Limits[k.Substring(6)] = l; }
                     else if (k.StartsWith("up.", StringComparison.OrdinalIgnoreCase)) Ups[k.Substring(3)] = (v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase));
                     else if (k.StartsWith("down.", StringComparison.OrdinalIgnoreCase)) Downs[k.Substring(5)] = (v == "1" || string.Equals(v, "true", StringComparison.OrdinalIgnoreCase));
                 }
@@ -178,6 +182,8 @@ namespace MuMuNetSim
                 if (!string.IsNullOrEmpty(PhoneIp)) sb.AppendLine("phone.ip=" + PhoneIp);
                 foreach (var kv in Presets) sb.AppendLine("preset." + kv.Key + "=" + kv.Value);
                 foreach (var kv in Delays) sb.AppendLine("delay." + kv.Key + "=" + kv.Value);
+                foreach (var kv in Jitters) sb.AppendLine("jitter." + kv.Key + "=" + kv.Value);
+                foreach (var kv in Limits) sb.AppendLine("limit." + kv.Key + "=" + kv.Value);
                 foreach (var kv in Ups) sb.AppendLine("up." + kv.Key + "=" + (kv.Value ? "1" : "0"));
                 foreach (var kv in Downs) sb.AppendLine("down." + kv.Key + "=" + (kv.Value ? "1" : "0"));
                 File.WriteAllText(IniPath, sb.ToString(), Encoding.UTF8);
@@ -428,6 +434,8 @@ namespace MuMuNetSim
         public long HoldSumMs;
         public long HoldCount;
         public long LastHoldMs;
+        public int JitterMs;      // 抖动：每包延迟在 [Ms-J, Ms+J] 内随机
+        public int LimitKBps;     // 限速：每方向令牌桶，KB/s
         public string Filter = "";
         public string LastError = "";
         public DateTime StartedAt = DateTime.Now;
@@ -438,12 +446,13 @@ namespace MuMuNetSim
             public IntPtr H;
             public Thread RecvThread;
             public Thread SendThread;
-            public readonly Queue<Pkt> Q = new Queue<Pkt>();
+            public readonly SortedDictionary<long, Queue<Pkt>> Q = new SortedDictionary<long, Queue<Pkt>>();
             public readonly object Lock = new object();
             public volatile bool RecvDone;
         }
 
         readonly List<Ctx> _ctxs = new List<Ctx>();
+        readonly Random _rnd = new Random();
         static readonly Stopwatch Sw = Stopwatch.StartNew();
         static long NowMs() { return Sw.ElapsedMilliseconds; }
 
@@ -493,8 +502,16 @@ namespace MuMuNetSim
                 var a = new byte[64];
                 Buffer.BlockCopy(addr, 0, a, 0, 64);
                 var p = new Pkt();
-                p.Data = pkt; p.Addr = a; p.RecvAt = NowMs(); p.Due = p.RecvAt + Ms;
-                lock (ctx.Lock) ctx.Q.Enqueue(p);
+                long hold = Ms;
+                if (JitterMs > 0) hold += _rnd.Next(-JitterMs, JitterMs + 1);
+                if (hold < 0) hold = 0;
+                p.Data = pkt; p.Addr = a; p.RecvAt = NowMs(); p.Due = p.RecvAt + hold;
+                lock (ctx.Lock)
+                {
+                    Queue<Pkt> q;
+                    if (!ctx.Q.TryGetValue(p.Due, out q)) { q = new Queue<Pkt>(); ctx.Q[p.Due] = q; }
+                    q.Enqueue(p);
+                }
             }
             ctx.RecvDone = true;
         }
@@ -504,20 +521,35 @@ namespace MuMuNetSim
             while (true)
             {
                 Pkt p = null;
-                lock (ctx.Lock) { if (ctx.Q.Count > 0) p = ctx.Q.Peek(); }
+                lock (ctx.Lock)
+                {
+                    if (ctx.Q.Count > 0)
+                    {
+                        long key = ctx.Q.Keys.First();
+                        if (key <= NowMs() + 1)
+                        {
+                            var q = ctx.Q[key];
+                            p = q.Dequeue();
+                            if (q.Count == 0) ctx.Q.Remove(key);
+                        }
+                    }
+                }
                 if (p == null)
                 {
                     if (Stopping && ctx.RecvDone) break;
-                    Thread.Sleep(2);
+                    Thread.Sleep(1);
                     continue;
                 }
-                long wait = p.Due - NowMs();
-                if (wait > 0) { Thread.Sleep((int)Math.Min(wait, 5)); continue; }
-                lock (ctx.Lock) { if (ctx.Q.Count > 0) ctx.Q.Dequeue(); }
+                // 限速：按包大小反推应占用的时间（令牌桶的简化等价写法，单方向串行发送）
+                if (LimitKBps > 0)
+                {
+                    double need = p.Data.Length * 1000.0 / (LimitKBps * 1024.0);
+                    if (need >= 1) Thread.Sleep((int)Math.Min(need, 2000));
+                }
                 uint sl;
-                long hold = NowMs() - p.RecvAt;
-                LastHoldMs = hold;
-                Interlocked.Add(ref HoldSumMs, hold);
+                long held = NowMs() - p.RecvAt;
+                LastHoldMs = held;
+                Interlocked.Add(ref HoldSumMs, held);
                 Interlocked.Increment(ref HoldCount);
                 if (WinDivertNative.Send(ctx.H, p.Data, (uint)p.Data.Length, out sl, p.Addr)) Interlocked.Increment(ref Sent);
             }
@@ -528,13 +560,22 @@ namespace MuMuNetSim
             Stopping = true;
             foreach (var c in _ctxs) WinDivertNative.Shutdown(c.H);
             foreach (var c in _ctxs) { try { c.RecvThread.Join(1500); } catch { } }
-            // 把队列里剩下的立刻发出去，避免丢包
+            // 把队列里剩下的按到期时间顺序立刻发出去，避免丢包
             foreach (var c in _ctxs)
             {
                 while (true)
                 {
                     Pkt p = null;
-                    lock (c.Lock) { if (c.Q.Count > 0) p = c.Q.Dequeue(); }
+                    lock (c.Lock)
+                    {
+                        if (c.Q.Count > 0)
+                        {
+                            long key = c.Q.Keys.First();
+                            var q = c.Q[key];
+                            p = q.Dequeue();
+                            if (q.Count == 0) c.Q.Remove(key);
+                        }
+                    }
                     if (p == null) break;
                     uint sl;
                     WinDivertNative.Send(c.H, p.Data, (uint)p.Data.Length, out sl, p.Addr);
@@ -1078,6 +1119,8 @@ namespace MuMuNetSim
     {
         public int Port = 8899;
         public int DelayMs;
+        public int JitterMs;      // 抖动
+        public int LimitKBps;     // 限速
         public bool Up = true, Down = true;      // 上行 = 手机->服务器，下行 = 服务器->手机
         public int LossPercent;
         public long Connections, BytesUp, BytesDown;
@@ -1225,7 +1268,16 @@ namespace MuMuNetSim
                     int n = from.Read(buf, 0, buf.Length);
                     if (n <= 0) break;
                     if (LossPercent > 0 && _rnd.Next(100) < LossPercent) continue;
-                    if (DelayMs > 0 && ((uplink && Up) || (!uplink && Down))) Thread.Sleep(DelayMs);
+                    bool applyDelay = (uplink && Up) || (!uplink && Down);
+                    int d = DelayMs;
+                    if (JitterMs > 0) d += _rnd.Next(-JitterMs, JitterMs + 1);
+                    if (d < 0) d = 0;
+                    if (applyDelay && d > 0) Thread.Sleep(d);
+                    if (LimitKBps > 0)
+                    {
+                        double need = n * 1000.0 / (LimitKBps * 1024.0);
+                        if (need >= 1) Thread.Sleep((int)Math.Min(need, 2000));
+                    }
                     to.Write(buf, 0, n);
                     to.Flush();
                     if (uplink) Interlocked.Add(ref BytesUp, n); else Interlocked.Add(ref BytesDown, n);
@@ -1366,19 +1418,21 @@ namespace MuMuNetSim
                 if (args.Length > 0 && args[0].Equals("/phone", StringComparison.OrdinalIgnoreCase))
                 {
                     string serial = "", preset = "normal", pDir = "both";
-                    int lossPct = 0, pMs = 0, pSeconds = 0;
+                    int lossPct = 0, pMs = 0, pSeconds = 0, pJitter = 0, pLimit = 0;
                     for (int i = 0; i < args.Length; i++)
                     {
                         if (args[i].Equals("/ip", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) serial = args[i + 1];
                         if (args[i].Equals("/preset", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) preset = args[i + 1].ToLowerInvariant();
                         if (args[i].Equals("/loss", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out lossPct);
+                        if (args[i].Equals("/jitter", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out pJitter);
+                        if (args[i].Equals("/limit", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out pLimit);
                         if (args[i].Equals("/ms", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out pMs);
                         if (args[i].Equals("/seconds", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out pSeconds);
                         if (args[i].Equals("/dir", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) pDir = args[i + 1].ToLowerInvariant();
                     }
                     if (serial.Length == 0)
                     {
-                        sb.AppendLine("用法：/phone /ip 192.168.1.50:5555 /preset normal|loss|delay|delayloss|offline [/ms 300] [/loss 30] [/dir both|up|down] [/seconds 20]");
+                        sb.AppendLine("用法：/phone /ip 192.168.1.50:5555 /preset normal|loss|delay|delayloss|offline [/ms 300] [/jitter 50] [/limit 200] [/loss 30] [/dir both|up|down] [/seconds 20]");
                         Console.WriteLine(sb);
                         return 2;
                     }
@@ -1408,7 +1462,7 @@ namespace MuMuNetSim
                         {
                             string hostIp = DelayProxy.HostIpForPeer(serial.Split(':')[0]);
                             px = new DelayProxy();
-                            px.DelayMs = pMs;
+                            px.DelayMs = pMs; px.JitterMs = pJitter; px.LimitKBps = pLimit;
                             px.Up = pDir != "down";
                             px.Down = pDir != "up";
                             px.LossPercent = (preset == "delayloss" && !info.Root) ? lossPct : 0;
@@ -1417,7 +1471,7 @@ namespace MuMuNetSim
                             DelayProxy.EnsureFirewallRule(px.Port);
                             string spec = hostIp + ":" + px.Port;
                             Phone.SetGlobalProxy(serial, spec);
-                            sb.AppendLine("本机代理 " + spec + "：时延 " + pMs + "ms " + (px.Up && px.Down ? "上下行" : (px.Up ? "仅上行" : "仅下行")) + (px.LossPercent > 0 ? "，丢包 " + px.LossPercent + "%" : ""));
+                            sb.AppendLine("本机代理 " + spec + "：时延 " + pMs + "ms" + (pJitter > 0 ? "±" + pJitter + "ms" : "") + " " + (px.Up && px.Down ? "上下行" : (px.Up ? "仅上行" : "仅下行")) + (pLimit > 0 ? "，限速 " + pLimit + "KB/s" : "") + (px.LossPercent > 0 ? "，丢包 " + px.LossPercent + "%" : ""));
                             sb.AppendLine("设备全局代理现在 = " + Phone.GetGlobalProxy(serial));
                         }
                         Console.WriteLine(sb);
@@ -1475,7 +1529,7 @@ namespace MuMuNetSim
                 }
 
                 string mode = "normal", dir = "both", customFilter = "";
-                int idx = -1, ms = 0, seconds = 0;
+                int idx = -1, ms = 0, seconds = 0, jitter = 0, limit = 0;
                 for (int i = 0; i < args.Length; i++)
                 {
                     if (args[i].Equals("/apply", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) mode = args[i + 1].ToLowerInvariant();
@@ -1485,6 +1539,8 @@ namespace MuMuNetSim
                     if (args[i].Equals("/seconds", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out seconds);
                     if (args[i].Equals("/dir", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) dir = args[i + 1].ToLowerInvariant();
                     if (args[i].Equals("/filter", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) customFilter = args[i + 1];
+                    if (args[i].Equals("/jitter", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out jitter);
+                    if (args[i].Equals("/limit", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out limit);
                 }
 
                 Action<string> log = delegate(string s) { Console.WriteLine(s); App.Log(s); };
@@ -1504,10 +1560,10 @@ namespace MuMuNetSim
                     }
                     var eng = new DelayEngine();
                     eng.Instance = inst == null ? -1 : inst.Index;
-                    eng.Ms = ms; eng.Up = dir != "down"; eng.Down = dir != "up";
+                    eng.Ms = ms; eng.JitterMs = jitter; eng.LimitKBps = limit; eng.Up = dir != "down"; eng.Down = dir != "up";
                     string err;
                     if (!eng.Start(filter, out err)) { log("延迟引擎启动失败：" + err); return 4; }
-                    log("延迟引擎已启动：" + (inst == null ? "(自定义过滤器)" : "实例 " + inst.Index) + " " + ms + "ms " + eng.DirText + " 端口数=" + portCount);
+                    log("延迟引擎已启动：" + (inst == null ? "(自定义过滤器)" : "实例 " + inst.Index) + " " + ms + "ms" + (jitter > 0 ? "±" + jitter + "ms" : "") + (limit > 0 ? " 限速" + limit + "KB/s" : "") + " " + eng.DirText + " 端口数=" + portCount);
                     log("过滤器：" + filter);
                     int total = seconds > 0 ? seconds : 15;
                     int lastCount = 0;
@@ -1572,7 +1628,7 @@ namespace MuMuNetSim
         Label lblPhoneStatus;
         ComboBox cmbPhonePreset;
         Button btnPhoneConnect, btnPhoneDisconnect, btnPhoneApply, btnPhoneNormal;
-        TextBox txtPhoneLoss, txtPhoneMs;
+        TextBox txtPhoneLoss, txtPhoneMs, txtPhoneJitter, txtPhoneLimit;
         CheckBox chkPhoneUp, chkPhoneDown;
         DelayProxy _proxy;
         PhoneInfo _phone;
@@ -1604,7 +1660,7 @@ namespace MuMuNetSim
         bool _suppress;
         string _lastShape = "";
 
-        const int C_INDEX = 0, C_NAME = 1, C_AND = 2, C_STATE = 3, C_PRESET = 4, C_DELAY = 5, C_UP = 6, C_DOWN = 7, C_ACTUAL = 8, C_OP = 9;
+        const int C_INDEX = 0, C_NAME = 1, C_AND = 2, C_STATE = 3, C_PRESET = 4, C_DELAY = 5, C_JITTER = 6, C_LIMIT = 7, C_UP = 8, C_DOWN = 9, C_ACTUAL = 10, C_OP = 11;
 
         public MainForm()
         {
@@ -1675,14 +1731,18 @@ namespace MuMuNetSim
             cPreset.DisplayStyle = DataGridViewComboBoxDisplayStyle.ComboBox;
             cPreset.Items.AddRange(Presets.Names);
             var cDelay = new DataGridViewTextBoxColumn();
-            cDelay.HeaderText = "延迟ms"; cDelay.Width = 62;
+            cDelay.HeaderText = "延迟ms"; cDelay.Width = 56;
+            var cJitter = new DataGridViewTextBoxColumn();
+            cJitter.HeaderText = "抖动ms"; cJitter.Width = 56;
+            var cLimit = new DataGridViewTextBoxColumn();
+            cLimit.HeaderText = "限速KB/s"; cLimit.Width = 64;
             var cUp = new DataGridViewCheckBoxColumn(); cUp.HeaderText = "上行"; cUp.Width = 44;
             var cDown = new DataGridViewCheckBoxColumn(); cDown.HeaderText = "下行"; cDown.Width = 44;
-            var cActual = Col("实际状态", 196);
+            var cActual = Col("实际状态", 190);
             var cOp = new DataGridViewButtonColumn();
-            cOp.HeaderText = "操作"; cOp.Width = 78; cOp.ReadOnly = true; cOp.UseColumnTextForButtonValue = false;
+            cOp.HeaderText = "操作"; cOp.Width = 74; cOp.ReadOnly = true; cOp.UseColumnTextForButtonValue = false;
 
-            grid.Columns.AddRange(new DataGridViewColumn[] { cIdx, cName, cAnd, cState, cPreset, cDelay, cUp, cDown, cActual, cOp });
+            grid.Columns.AddRange(new DataGridViewColumn[] { cIdx, cName, cAnd, cState, cPreset, cDelay, cJitter, cLimit, cUp, cDown, cActual, cOp });
             grid.CellValueChanged += Grid_CellValueChanged;
             grid.CurrentCellDirtyStateChanged += delegate(object s, EventArgs e)
             {
@@ -1789,29 +1849,49 @@ namespace MuMuNetSim
             chkPhoneUp = new CheckBox();
             chkPhoneUp.Text = "上行";
             chkPhoneUp.Checked = true;
-            chkPhoneUp.SetBounds(508, 106, 56, 22);
+            chkPhoneUp.SetBounds(508, 106, 52, 22);
             tab2.Controls.Add(chkPhoneUp);
 
             chkPhoneDown = new CheckBox();
             chkPhoneDown.Text = "下行";
             chkPhoneDown.Checked = true;
-            chkPhoneDown.SetBounds(566, 106, 56, 22);
+            chkPhoneDown.SetBounds(562, 106, 52, 22);
             tab2.Controls.Add(chkPhoneDown);
+
+            var lblPJ = new Label();
+            lblPJ.Text = "抖动ms：";
+            lblPJ.SetBounds(12, 142, 58, 22);
+            tab2.Controls.Add(lblPJ);
+
+            txtPhoneJitter = new TextBox();
+            txtPhoneJitter.Text = "0";
+            txtPhoneJitter.SetBounds(72, 138, 54, 24);
+            tab2.Controls.Add(txtPhoneJitter);
+
+            var lblPL = new Label();
+            lblPL.Text = "限速KB/s：";
+            lblPL.SetBounds(134, 142, 68, 22);
+            tab2.Controls.Add(lblPL);
+
+            txtPhoneLimit = new TextBox();
+            txtPhoneLimit.Text = "0";
+            txtPhoneLimit.SetBounds(204, 138, 60, 24);
+            tab2.Controls.Add(txtPhoneLimit);
 
             btnPhoneApply = new Button();
             btnPhoneApply.Text = "应用到手机";
-            btnPhoneApply.SetBounds(632, 103, 100, 28);
+            btnPhoneApply.SetBounds(282, 137, 100, 28);
             btnPhoneApply.Click += delegate { PhoneApply(); };
             tab2.Controls.Add(btnPhoneApply);
 
             btnPhoneNormal = new Button();
             btnPhoneNormal.Text = "恢复正常";
-            btnPhoneNormal.SetBounds(738, 103, 90, 28);
+            btnPhoneNormal.SetBounds(388, 137, 90, 28);
             btnPhoneNormal.Click += delegate { PhoneNormal(); };
             tab2.Controls.Add(btnPhoneNormal);
 
             var lblPHint = new Label();
-            lblPHint.SetBounds(12, 142, 830, 262);
+            lblPHint.SetBounds(12, 176, 830, 228);
             lblPHint.ForeColor = Color.DimGray;
             lblPHint.Text =
                 "手机侧两种干预方式（可叠加）：\r\n" +
@@ -1971,6 +2051,8 @@ namespace MuMuNetSim
                     row.Cells[C_STATE].Value = inst.Running ? "运行中" : "已停止";
                     row.Cells[C_PRESET].Value = Presets.Names[Presets.IndexOfKey(GetPreset(inst.Index))];
                     row.Cells[C_DELAY].Value = GetDelay(inst.Index).ToString();
+                    row.Cells[C_JITTER].Value = GetJitter(inst.Index).ToString();
+                    row.Cells[C_LIMIT].Value = GetLimit(inst.Index).ToString();
                     row.Cells[C_UP].Value = GetUp(inst.Index);
                     row.Cells[C_DOWN].Value = GetDown(inst.Index);
                     row.Cells[C_ACTUAL].Value = inst.Running ? "未套用" : "待启动（启动后自动套用）";
@@ -1981,6 +2063,8 @@ namespace MuMuNetSim
         }
 
         string GetPreset(int idx) { string v; return App.Presets.TryGetValue(idx.ToString(), out v) ? v : "normal"; }
+        int GetJitter(int idx) { int v; return App.Jitters.TryGetValue(idx.ToString(), out v) ? v : 0; }
+        int GetLimit(int idx) { int v; return App.Limits.TryGetValue(idx.ToString(), out v) ? v : 0; }
         int GetDelay(int idx) { int v; return App.Delays.TryGetValue(idx.ToString(), out v) ? v : 0; }
         bool GetUp(int idx) { bool v; return App.Ups.TryGetValue(idx.ToString(), out v) ? v : true; }
         bool GetDown(int idx) { bool v; return App.Downs.TryGetValue(idx.ToString(), out v) ? v : true; }
@@ -2006,6 +2090,24 @@ namespace MuMuNetSim
                 if (ms > 10000) ms = 10000;
                 App.Delays[key] = ms;
                 Log("实例 " + idx + " 延迟 -> " + ms + "ms");
+            }
+            else if (e.ColumnIndex == C_JITTER)
+            {
+                int j;
+                int.TryParse(Convert.ToString(row.Cells[C_JITTER].Value), out j);
+                if (j < 0) j = 0;
+                if (j > 5000) j = 5000;
+                App.Jitters[key] = j;
+                Log("实例 " + idx + " 抖动 -> " + j + "ms");
+            }
+            else if (e.ColumnIndex == C_LIMIT)
+            {
+                int l;
+                int.TryParse(Convert.ToString(row.Cells[C_LIMIT].Value), out l);
+                if (l < 0) l = 0;
+                if (l > 1000000) l = 1000000;
+                App.Limits[key] = l;
+                Log("实例 " + idx + " 限速 -> " + l + "KB/s");
             }
             else if (e.ColumnIndex == C_UP) { App.Ups[key] = Convert.ToBoolean(row.Cells[C_UP].Value ?? false); }
             else if (e.ColumnIndex == C_DOWN) { App.Downs[key] = Convert.ToBoolean(row.Cells[C_DOWN].Value ?? false); }
@@ -2051,9 +2153,11 @@ namespace MuMuNetSim
                 int idx = inst.Index;
                 string preset = GetPreset(idx);
                 int ms = GetDelay(idx);
+                int jitter = GetJitter(idx);
+                int limit = GetLimit(idx);
                 bool up = GetUp(idx), down = GetDown(idx);
-                bool wantDelay = ms > 0 && (up || down);
-                string want = preset + "|" + (wantDelay ? ms + "|" + (up ? "u" : "") + (down ? "d" : "") : "0");
+                bool wantDelay = (ms > 0 && (up || down)) || limit > 0;
+                string want = preset + "|" + (wantDelay ? ms + "|" + jitter + "|" + limit + "|" + (up ? "u" : "") + (down ? "d" : "") : "0");
 
                 if (!inst.Running || !inst.AndroidStarted)
                 {
@@ -2077,7 +2181,7 @@ namespace MuMuNetSim
                 }
                 if (had && have == want)
                 {
-                    RefreshEngineIfPortsChanged(idx, ms, up, down);
+                    RefreshEngineIfPortsChanged(idx, ms, jitter, limit, up, down);
                     ShowCounters(idx);
                     continue;
                 }
@@ -2093,7 +2197,14 @@ namespace MuMuNetSim
                 if (wantDelay)
                 {
                     string err;
-                    if (StartEngine(idx, ms, up, down, out err)) desc.Add("延迟 " + ms + "ms(" + DirText(up, down) + ")");
+                    if (StartEngine(idx, ms, jitter, limit, up, down, out err))
+                    {
+                        var d2 = new List<string>();
+                        if (ms > 0) d2.Add("延迟 " + ms + "ms(" + DirText(up, down) + ")");
+                        if (jitter > 0) d2.Add("抖动 ±" + jitter + "ms");
+                        if (limit > 0) d2.Add("限速 " + limit + "KB/s");
+                        desc.Add(string.Join("+", d2.ToArray()));
+                    }
                     else desc.Add("延迟失败：" + err);
                 }
                 else StopEngine(idx);
@@ -2120,7 +2231,7 @@ namespace MuMuNetSim
 
         static string DirText(bool up, bool down) { return up && down ? "上下行" : (up ? "仅上行" : "仅下行"); }
 
-        bool StartEngine(int idx, int ms, bool up, bool down, out string err)
+        bool StartEngine(int idx, int ms, int jitter, int limit, bool up, bool down, out string err)
         {
             err = "";
             int portCount;
@@ -2133,7 +2244,7 @@ namespace MuMuNetSim
                 UiLog("已关闭全局 clumsy（与每实例延迟互斥）");
             }
             var eng = new DelayEngine();
-            eng.Instance = idx; eng.Ms = ms; eng.Up = up; eng.Down = down;
+            eng.Instance = idx; eng.Ms = ms; eng.JitterMs = jitter; eng.LimitKBps = limit; eng.Up = up; eng.Down = down;
             if (!eng.Start(filter, out err))
             {
                 if (err.Contains("拒绝访问") || err.Contains("Access is denied") || err.Contains("5"))
@@ -2165,7 +2276,7 @@ namespace MuMuNetSim
 
         bool EngineRunning(int idx) { lock (_engineLock) { return _engines.ContainsKey(idx); } }
 
-        void RefreshEngineIfPortsChanged(int idx, int ms, bool up, bool down)
+        void RefreshEngineIfPortsChanged(int idx, int ms, int jitter, int limit, bool up, bool down)
         {
             if (!EngineRunning(idx)) return;
             DateTime last;
@@ -2178,7 +2289,7 @@ namespace MuMuNetSim
             lock (_engineLock) { _engineFilter.TryGetValue(idx, out old); }
             if (filter == old) return;
             string err;
-            if (StartEngine(idx, ms, up, down, out err)) UiLog("实例 " + idx + " 出现新端口，延迟引擎已刷新（覆盖 " + cnt + " 个端口）");
+            if (StartEngine(idx, ms, jitter, limit, up, down, out err)) UiLog("实例 " + idx + " 出现新端口，延迟引擎已刷新（覆盖 " + cnt + " 个端口）");
         }
 
         void SetActual(int idx, string text)
@@ -2195,6 +2306,8 @@ namespace MuMuNetSim
         {
             foreach (var k in App.Presets.Keys.ToList()) App.Presets[k] = "normal";
             foreach (var k in App.Delays.Keys.ToList()) App.Delays[k] = 0;
+            foreach (var k in App.Jitters.Keys.ToList()) App.Jitters[k] = 0;
+            foreach (var k in App.Limits.Keys.ToList()) App.Limits[k] = 0;
             App.SaveIni();
             var th = new Thread(delegate()
             {
@@ -2214,6 +2327,8 @@ namespace MuMuNetSim
                     {
                         row.Cells[C_PRESET].Value = Presets.Names[0];
                         row.Cells[C_DELAY].Value = "0";
+                        row.Cells[C_JITTER].Value = "0";
+                        row.Cells[C_LIMIT].Value = "0";
                         row.Cells[C_UP].Value = true;
                         row.Cells[C_DOWN].Value = true;
                     }
@@ -2315,6 +2430,8 @@ namespace MuMuNetSim
             bool useMs = (key == "delay" || key == "delayloss");
             txtPhoneLoss.Enabled = useLoss;
             txtPhoneMs.Enabled = useMs;
+            txtPhoneJitter.Enabled = useMs;
+            txtPhoneLimit.Enabled = useMs;
             chkPhoneUp.Enabled = useMs;
             chkPhoneDown.Enabled = useMs;
         }
@@ -2334,6 +2451,9 @@ namespace MuMuNetSim
             int lossPct = 0, ms = 0;
             int.TryParse((txtPhoneLoss.Text ?? "").Trim(), out lossPct);
             int.TryParse((txtPhoneMs.Text ?? "").Trim(), out ms);
+            int jitter = 0, limit = 0;
+            int.TryParse((txtPhoneJitter.Text ?? "").Trim(), out jitter);
+            int.TryParse((txtPhoneLimit.Text ?? "").Trim(), out limit);
             bool up = chkPhoneUp.Checked, down = chkPhoneDown.Checked;
             bool deviceLoss = (key == "offline") || (key == "loss") || (key == "delayloss");
             if (deviceLoss && !p.Root)
@@ -2360,13 +2480,16 @@ namespace MuMuNetSim
                     }
                     if (key == "delay" || key == "delayloss")
                     {
-                        if (ms <= 0) UiLog("时延要大于 0 才会生效");
+                        bool wantProxy = (ms > 0 && (up || down)) || jitter > 0 || limit > 0;
+                        if (!wantProxy) UiLog("时延 / 抖动 / 限速 都填 0 的话不会有任何变化");
                         else
                         {
                             string peer = p.Serial.Split(':')[0];
                             string hostIp = DelayProxy.HostIpForPeer(peer);
                             var px = new DelayProxy();
                             px.DelayMs = ms;
+                            px.JitterMs = jitter;
+                            px.LimitKBps = limit;
                             px.Up = up;
                             px.Down = down;
                             px.LossPercent = (key == "delayloss" && !p.Root) ? Math.Max(0, Math.Min(100, lossPct)) : 0;
@@ -2377,7 +2500,11 @@ namespace MuMuNetSim
                                 DelayProxy.EnsureFirewallRule(px.Port);
                                 string spec = hostIp + ":" + px.Port;
                                 Phone.SetGlobalProxy(p.Serial, spec);
-                                desc.Add("时延 " + ms + "ms(" + DirText(up, down) + ")@本机代理 " + spec);
+                                var d = new List<string>();
+                                if (ms > 0) d.Add("时延 " + ms + "ms(" + DirText(up, down) + ")");
+                                if (jitter > 0) d.Add("抖动 ±" + jitter + "ms");
+                                if (limit > 0) d.Add("限速 " + limit + "KB/s");
+                                desc.Add(string.Join("+", d.ToArray()) + "@本机代理 " + spec);
                             }
                             else { UiLog("代理启动失败：" + err); desc.Add("时延失败"); }
                         }

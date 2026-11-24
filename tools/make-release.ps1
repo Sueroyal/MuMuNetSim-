@@ -49,6 +49,18 @@ $assets = @(
 )
 foreach ($a in $assets) { if (-not (Test-Path $a)) { throw "缺少发布包：$a（先跑 build.ps1 -Package 与 build.ps1 -Single -Package）" } }
 
+# 稳定别名资产：releases/latest/download/<固定名> 永远可下载（发版时同步上传）
+$aliasDir = Join-Path $env:TEMP ('mumunetsim_alias_' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $aliasDir | Out-Null
+$aliasFiles = @()
+foreach ($a in $assets) {
+    $alias = if ($a -like '*-single.zip') { 'MuMuNetSim-single.zip' } else { 'MuMuNetSim.zip' }
+    $dst = Join-Path $aliasDir $alias
+    Copy-Item $a $dst -Force
+    $aliasFiles += $dst
+}
+$allFiles = @($assets) + @($aliasFiles)
+
 $hashLines = foreach ($a in $assets) {
     $h = (Get-FileHash $a -Algorithm SHA256).Hash
     "- ``{0}``  ({1:N1} MB)  SHA256: ``{2}``" -f (Split-Path $a -Leaf), ((Get-Item $a).Length / 1MB), $h
@@ -81,6 +93,10 @@ MuMu 模拟器单实例 / 局域网手机的**弱网、断网、延迟**模拟�
 - MuMu 装在哪都行（自动探测；找不到会让你手动指定）
 - 未签名，SmartScreen 拦一下时点「更多信息 → 仍要运行」
 
+### 固定下载链接（永远指向最新版，适合发群里）
+- 单文件版：https://github.com/Sueroyal/MuMuNetSim-/releases/latest/download/MuMuNetSim-single.zip
+- 目录版　：https://github.com/Sueroyal/MuMuNetSim-/releases/latest/download/MuMuNetSim.zip
+
 ### 校验
 $($hashLines -join "`r`n")
 
@@ -93,11 +109,11 @@ $notesFile = Join-Path $env:TEMP 'mumunetsim_release_notes.md'
 Log "创建/更新 Release $Tag …"
 $exists = (& $gh release view $Tag -R $Repo 2>&1 | Out-String)
 if ($exists -match 'not found|release not found') {
-    & $gh release create $Tag @assets -R $Repo --target main --title "MuMuNetSim $Tag 单文件版 + 目录版" --notes-file $notesFile 2>&1 | ForEach-Object { Log $_ }
+    & $gh release create $Tag @allFiles -R $Repo --target main --title "MuMuNetSim $Tag 单文件版 + 目录版" --notes-file $notesFile 2>&1 | ForEach-Object { Log $_ }
 }
 else {
     Log "Release $Tag 已存在，改为上传/覆盖资产"
-    & $gh release upload $Tag @assets -R $Repo --clobber 2>&1 | ForEach-Object { Log $_ }
+    & $gh release upload $Tag @allFiles -R $Repo --clobber 2>&1 | ForEach-Object { Log $_ }
     & $gh release edit $Tag -R $Repo --notes-file $notesFile 2>&1 | ForEach-Object { Log $_ }
 }
 $view = (& $gh release view $Tag -R $Repo --json url,assets 2>&1 | Out-String)

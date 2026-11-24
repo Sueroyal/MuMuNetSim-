@@ -31,6 +31,9 @@ Write-Host "1) 在 %TEMP% 做 mirror 克隆（绕开工作区 push 的限制）"
 if (Test-Path $mirror) { Remove-Item $mirror -Recurse -Force }
 git clone --mirror $root $mirror | Out-Null
 git -C $mirror remote set-url origin $Repo
+# clone --mirror 会给 origin 打上 mirror=true，直接 push refspec 会被拒
+# （fatal: --mirror can't be combined with refspecs），这里摘掉它
+git -C $mirror config --unset remote.origin.mirror 2>$null
 
 $refspec = "refs/heads/${Branch}:refs/heads/${Branch}"
 if ($DryRun) {

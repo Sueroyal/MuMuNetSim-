@@ -13,7 +13,8 @@ param(
     [switch]$SkipClumsy,
     [switch]$ForceClumsy,
     [switch]$Package,
-    [switch]$Single
+    [switch]$Single,
+    [switch]$DocsOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -151,6 +152,17 @@ function Get-IconArgs {
     }
     catch { Write-Warning "图标生成失败（不影响功能）：$($_.Exception.Message)" }
     return @()
+}
+
+# ---------------------------------------------------------------- 只生成文档
+if ($DocsOnly) {
+    New-Item -ItemType Directory -Force -Path $dist | Out-Null
+    Set-Content -Path (Join-Path $dist '使用说明.txt') -Value $readmeText -Encoding UTF8
+    Set-Content -Path (Join-Path $dist '第三方组件与许可.txt') -Value $thirdPartyText -Encoding UTF8
+    Write-Host "已重新生成文档：$dist"
+    Write-Host ('  ' + (Join-Path $dist '使用说明.txt'))
+    Write-Host ('  ' + (Join-Path $dist '第三方组件与许可.txt'))
+    return
 }
 
 # ---------------------------------------------------------------- 单文件版

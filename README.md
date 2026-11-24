@@ -1,17 +1,33 @@
-# MuMuNetSim
+﻿# MuMuNetSim
 
-给 **MuMu 模拟器的每个实例单独预设网络环境**的小工具：断网 / 丢包档位 / 自定义延迟（可只做上行或只做下行），
-实例启动后自动套用。单文件 exe，弱网能力整合了开源的 [clumsy](https://github.com/jagt/clumsy)（WinDivert 驱动 + clumsy 本体）。
+[![Release](https://img.shields.io/github/v/release/Sueroyal/MuMuNetSim-?label=release&color=blue)](https://github.com/Sueroyal/MuMuNetSim-/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Sueroyal/MuMuNetSim-/total?label=downloads)](https://github.com/Sueroyal/MuMuNetSim-/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+给 **MuMu 模拟器的每个实例单独预设网络环境**的小工具：断网 / 丢包档位 / 自定义延迟、抖动、限速（可只做上行或只做下行），
+实例启动后自动套用；也能按 IP 管局域网里的手机。单文件 exe，弱网能力整合了开源的
+[clumsy](https://github.com/jagt/clumsy)（WinDivert 驱动 + clumsy 本体）。
+
+## 下载（发给同事就用这两个固定链接，永远指向最新版）
+
+| | 链接 | 说明 |
+|---|---|---|
+| **单文件版（推荐）** | https://github.com/Sueroyal/MuMuNetSim-/releases/latest/download/MuMuNetSim-single.zip | 解压得到**一个 exe**，内置 adb + clumsy/WinDivert |
+| 目录版 | https://github.com/Sueroyal/MuMuNetSim-/releases/latest/download/MuMuNetSim.zip | exe + `adb\` + `clumsy\` + 说明与许可 |
+| 全部版本 | https://github.com/Sueroyal/MuMuNetSim-/releases | 每个版本另有带版本号的资产 + SHA256 |
+
+> 未签名，SmartScreen 拦一下时点「更多信息 → 仍要运行」；首次启动点 UAC「是」。
 
 ```
-每实例单独预设：断网 / 丢包档位 / 延迟(ms，可分别只做上行或下行)；实例启动后自动套用
+每实例单独预设：断网 / 丢包档位 / 延迟ms / 抖动ms / 限速KB/s（上下行可分别设）；实例启动后自动套用
 [刷新实例] [全部恢复正常]  □ 全局弱网：延迟200ms+丢包5%（clumsy，整机出站；与每实例延迟互斥）        就绪
 
- 实例 | 名称           | Android | 状态   | 预设环境   | 延迟ms | 上行 | 下行 | 实际状态                              | 操作
-  4   | 包体拆分       | 12.0    | 运行中 | 丢包 45% ▾ |  300   |  ☑   |  ☑   | 已套用：丢包 45% + 延迟 300ms(上下行) · 收包 176/重发 176 | 关闭实例
-  5   | 未包体拆分     | 12.0    | 运行中 | 断网     ▾ |    0   |  ☑   |  ☑   | 已套用：断网                          | 关闭实例
-  0   | realese 包 pre | 12.0    | 已停止 | 丢包 15% ▾ |  500   |  ☑   |  ☐   | 待启动（启动后自动套用）              | 启动实例
+ 实例 | 名称           | Android | 状态   | 预设环境   | 延迟ms | 抖动ms | 限速KB/s | 上行 | 下行 | 实际状态                        | 操作
+  4   | 包体拆分       | 12.0    | 运行中 | 丢包 45% ▾ |  300   |   50   |   200    |  ☑   |  ☑   | 已套用：丢包 45% + 延迟 300ms(上下行)+抖动 ±50ms+限速 200KB/s | 关闭实例
+  5   | 未包体拆分     | 12.0    | 运行中 | 断网     ▾ |    0   |    0   |     0    |  ☑   |  ☑   | 已套用：断网                    | 关闭实例
+  0   | realese 包 pre | 12.0    | 已停止 | 丢包 15% ▾ |  500   |    0   |     0    |  ☑   |  ☐   | 待启动（启动后自动套用）        | 启动实例
 ```
+
 
 ## 三种干预，各自怎么实现
 
@@ -20,6 +36,8 @@
 | **断网** | 实例内 `iptables`（双向 DROP） | **仅该实例** | 放行 `lo` + adb 端口，所以断网中也能一键恢复；规则不落盘，重启实例即清空 |
 | **丢包 15%~100%（步长 10）** | 实例内 `iptables -m statistic --mode random` | **仅该实例** | 秒级生效；30% 档位实测 20 包样本得到 36%；100% 档 = 出方向全丢（近似断网，但不拦入方向） |
 | **延迟 X ms（上行/下行可选）** | 宿主机 WinDivert 抓包 → 定时重发 | **仅该实例** | 每实例一个独立引擎；过滤器 = 该实例 `MuMuVMMHeadless.exe` 占用的 TCP/UDP 端口 |
+| **抖动 ±Y ms** | 同上，每包延迟在 `X±Y` 内随机 | **仅该实例** | 实测 300±150ms 时握手耗时从 1.8s 散到 2.7s |
+| **限速 Z KB/s** | 同上，按包大小串行发送 | **仅该实例** | 实测 1MB / 200KB/s = 5.32s（直连 0.54s） |
 | 全局弱网（clumsy，可选） | 调 `clumsy.exe --filter "outbound and ip"` | 整机出站 | 粗粒度兜底；与每实例延迟互斥 |
 
 ## 为什么「延迟」要这么做
