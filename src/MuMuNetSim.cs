@@ -8,6 +8,9 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Management;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
@@ -768,11 +771,31 @@ namespace MuMuNetSim
             return info;
         }
 
-        // 手机端用独立链，便于清空；命令里不出现引号，避免多层转义
-        public static string ApplyPreset(PhoneInfo p, string preset)
+        // 给手机设/清全局 HTTP 代理（免 root，走 adb shell settings）
+        public static string SetGlobalProxy(string serial, string hostPort)
         {
-            string key = (preset ?? "normal").ToLowerInvariant();
+            return Shell(serial, "settings put global http_proxy " + hostPort);
+        }
+
+        public static string ClearGlobalProxy(string serial)
+        {
+            var a = Shell(serial, "settings put global http_proxy :0");
+            var b = Shell(serial, "settings delete global http_proxy");
+            return a + b;
+        }
+
+        public static string GetGlobalProxy(string serial)
+        {
+            return Shell(serial, "settings get global http_proxy").Trim();
+        }
+
+        // 设备内那部分（丢包 / 断网）：独立链 MT_OUT，始终放行 lo 与 adb 端口
+        public static string ApplyDevicePreset(PhoneInfo p, string key, int lossPct)
+        {
+            key = (key ?? "normal").ToLowerInvariant();
             int adbPort = p.AdbPort > 0 ? p.AdbPort : 5555;
+            if (key == "normal" || key == "delay") return Clear(p);
+
             var sb = new StringBuilder();
             sb.Append("iptables -N " + OUT_CHAIN + " 2>/dev/null; ");
             sb.Append("iptables -F " + OUT_CHAIN + " 2>/dev/null; ");
@@ -785,20 +808,17 @@ namespace MuMuNetSim
                 sb.Append("iptables -A " + OUT_CHAIN + " -j DROP; ");
                 desc = "断网";
             }
-            else if (key.StartsWith("loss"))
+            else
             {
-                int pct;
-                if (!int.TryParse(key.Substring(4), out pct)) pct = 0;
-                if (pct <= 0) return Clear(p);
-                var prob = (pct / 100.0).ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                if (lossPct <= 0) return Clear(p);
+                if (lossPct > 100) lossPct = 100;
+                var prob = (lossPct / 100.0).ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
                 sb.Append("iptables -A " + OUT_CHAIN + " -m statistic --mode random --probability " + prob + " -j DROP; ");
-                desc = "丢包 " + pct + "%";
+                desc = "丢包 " + lossPct + "%";
             }
-            else return Clear(p);
-
             sb.Append("iptables -C OUTPUT -j " + OUT_CHAIN + " 2>/dev/null || iptables -I OUTPUT 1 -j " + OUT_CHAIN);
             var outp = ShellRun(p, sb.ToString());
-            if (outp.Contains("Permission denied") || outp.Contains("not found") || outp.Contains("error"))
+            if (outp.Contains("Permission denied") || outp.Contains("No chain/target") || outp.Contains("not found"))
                 throw new Exception(outp.Trim());
             p.Applied = desc;
             return desc;
@@ -813,6 +833,245 @@ namespace MuMuNetSim
             try { ShellRun(p, cmd); } catch { }
             p.Applied = "正常";
             return "正常";
+        }
+    }
+
+    // 本机延迟代理：给手机设全局 HTTP 代理，用「带时延/丢包的转发」实现手机侧弱网（免 root）
+    public class DelayProxy
+    {
+        public int Port = 8899;
+        public int DelayMs;
+        public bool Up = true, Down = true;      // 上行 = 手机->服务器，下行 = 服务器->手机
+        public int LossPercent;
+        public long Connections, BytesUp, BytesDown;
+        volatile bool _stop;
+        TcpListener _listener;
+        readonly Random _rnd = new Random();
+
+        public bool Start(out string err)
+        {
+            err = "";
+            for (int p = Port; p < Port + 20; p++)
+            {
+                try
+                {
+                    var l = new TcpListener(IPAddress.Any, p);
+                    l.Start();
+                    _listener = l;
+                    Port = p;
+                    var th = new Thread(AcceptLoop);
+                    th.IsBackground = true;
+                    th.Start();
+                    return true;
+                }
+                catch (Exception ex) { err = ex.Message; }
+            }
+            return false;
+        }
+
+        public void Stop()
+        {
+            _stop = true;
+            try { if (_listener != null) _listener.Stop(); } catch { }
+            _listener = null;
+        }
+
+        void AcceptLoop()
+        {
+            while (!_stop)
+            {
+                TcpClient c = null;
+                try { c = _listener.AcceptTcpClient(); }
+                catch { break; }
+                if (_stop) { try { c.Close(); } catch { } break; }
+                Interlocked.Increment(ref Connections);
+                var th = new Thread(delegate() { Handle(c); });
+                th.IsBackground = true;
+                th.Start();
+            }
+        }
+
+        void Handle(TcpClient client)
+        {
+            TcpClient server = null;
+            try
+            {
+                client.NoDelay = true;
+                var cs = client.GetStream();
+                var head = new List<byte>();
+                var one = new byte[1];
+                while (head.Count < 32768)
+                {
+                    int n = cs.Read(one, 0, 1);
+                    if (n <= 0) return;
+                    head.Add(one[0]);
+                    int c = head.Count;
+                    if (c >= 4 && head[c - 4] == 13 && head[c - 3] == 10 && head[c - 2] == 13 && head[c - 1] == 10) break;
+                }
+                string headerText = Encoding.ASCII.GetString(head.ToArray());
+                var firstLine = headerText.Split('\n')[0].Trim();
+                var parts = firstLine.Split(' ');
+                if (parts.Length < 2) return;
+                string method = parts[0], target = parts[1];
+                bool isConnect = method.Equals("CONNECT", StringComparison.OrdinalIgnoreCase);
+                string host; int port;
+                if (isConnect)
+                {
+                    ParseHostPort(target, out host, out port);
+                    if (port == 0) port = 443;
+                }
+                else if (target.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                {
+                    var rest = target.Substring(7);
+                    int slash = rest.IndexOf('/');
+                    string hostport = slash < 0 ? rest : rest.Substring(0, slash);
+                    ParseHostPort(hostport, out host, out port);
+                    if (port == 0) port = 80;
+                    string path = slash < 0 ? "/" : rest.Substring(slash);
+                    headerText = headerText.Replace(firstLine, method + " " + path + " " + (parts.Length > 2 ? parts[2] : "HTTP/1.1"));
+                }
+                else
+                {
+                    ParseHostPort(target, out host, out port);
+                    if (port == 0) port = 80;
+                }
+                if (string.IsNullOrEmpty(host)) return;
+
+                server = new TcpClient();
+                server.NoDelay = true;
+                server.Connect(host, port);
+                var ss = server.GetStream();
+
+                if (isConnect)
+                {
+                    var ok = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n");
+                    cs.Write(ok, 0, ok.Length);
+                    cs.Flush();
+                }
+                else
+                {
+                    var b = Encoding.ASCII.GetBytes(headerText);
+                    ss.Write(b, 0, b.Length);
+                    ss.Flush();
+                }
+
+                var t1 = new Thread(delegate() { Pump(cs, ss, true); });
+                var t2 = new Thread(delegate() { Pump(ss, cs, false); });
+                t1.IsBackground = true; t2.IsBackground = true;
+                t1.Start(); t2.Start();
+                t1.Join(); t2.Join();
+            }
+            catch { }
+            finally
+            {
+                try { client.Close(); } catch { }
+                try { if (server != null) server.Close(); } catch { }
+            }
+        }
+
+        static void ParseHostPort(string s, out string host, out int port)
+        {
+            host = ""; port = 0;
+            if (string.IsNullOrEmpty(s)) return;
+            int i = s.LastIndexOf(':');
+            if (i > 0) { host = s.Substring(0, i); int.TryParse(s.Substring(i + 1), out port); }
+            else host = s;
+        }
+
+        void Pump(NetworkStream from, NetworkStream to, bool uplink)
+        {
+            var buf = new byte[16384];
+            try
+            {
+                while (!_stop)
+                {
+                    int n = from.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    if (LossPercent > 0 && _rnd.Next(100) < LossPercent) continue;
+                    if (DelayMs > 0 && ((uplink && Up) || (!uplink && Down))) Thread.Sleep(DelayMs);
+                    to.Write(buf, 0, n);
+                    to.Flush();
+                    if (uplink) Interlocked.Add(ref BytesUp, n); else Interlocked.Add(ref BytesDown, n);
+                }
+            }
+            catch { }
+            finally { try { to.Close(); } catch { } }
+        }
+
+        // 手机要能连到本机代理，得放行入站端口（程序已提权，静默加规则）
+        public static void EnsureFirewallRule(int port)
+        {
+            try
+            {
+                var netsh = Path.Combine(Environment.SystemDirectory, "netsh.exe");
+                var ruleName = "MuMuNetSim Delay Proxy " + port;
+                var chk = Proc.Run(netsh, "advfirewall firewall show rule name=\"" + ruleName + "\"", 8000);
+                if (chk.Contains(ruleName)) return;
+                Proc.Run(netsh, "advfirewall firewall add rule name=\"" + ruleName + "\" dir=in action=allow protocol=TCP localport=" + port, 12000);
+                App.Log("已添加入站放行规则：" + ruleName);
+            }
+            catch { }
+        }
+
+        // 选一个能到达对端的本机 IPv4（同网段优先，否则第一个非回环地址）
+        public static string HostIpForPeer(string peerIp)
+        {
+            try
+            {
+                var peer = IPAddress.Parse(peerIp);
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        if (ua.IPv4Mask == null) continue;
+                        if (IPAddress.IsLoopback(ua.Address)) continue;
+                        if (SameSubnet(ua.Address, peer, ua.IPv4Mask)) return ua.Address.ToString();
+                    }
+                }
+            }
+            catch { }
+            // 其次：优先选「有默认网关」的网卡（手机最可能和它在同一张网里）
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    var props = ni.GetIPProperties();
+                    bool hasGw = props.GatewayAddresses.Any(g => g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any));
+                    if (!hasGw) continue;
+                    foreach (var ua in props.UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        if (IPAddress.IsLoopback(ua.Address)) continue;
+                        return ua.Address.ToString();
+                    }
+                }
+            }
+            catch { }
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                        if (ua.Address.AddressFamily == AddressFamily.InterNetwork) return ua.Address.ToString();
+                }
+            }
+            catch { }
+            return "127.0.0.1";
+        }
+
+        static bool SameSubnet(IPAddress a, IPAddress b, IPAddress mask)
+        {
+            var ab = a.GetAddressBytes(); var bb = b.GetAddressBytes(); var mb = mask.GetAddressBytes();
+            if (ab.Length != 4 || bb.Length != 4 || mb.Length != 4) return false;
+            for (int i = 0; i < 4; i++) if ((ab[i] & mb[i]) != (bb[i] & mb[i])) return false;
+            return true;
         }
     }
 
@@ -869,22 +1128,82 @@ namespace MuMuNetSim
                 }
                 if (args.Length > 0 && args[0].Equals("/phone", StringComparison.OrdinalIgnoreCase))
                 {
-                    string serial = "", preset = "normal";
+                    string serial = "", preset = "normal", pDir = "both";
+                    int lossPct = 0, pMs = 0, pSeconds = 0;
                     for (int i = 0; i < args.Length; i++)
                     {
                         if (args[i].Equals("/ip", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) serial = args[i + 1];
                         if (args[i].Equals("/preset", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) preset = args[i + 1].ToLowerInvariant();
+                        if (args[i].Equals("/loss", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out lossPct);
+                        if (args[i].Equals("/ms", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out pMs);
+                        if (args[i].Equals("/seconds", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out pSeconds);
+                        if (args[i].Equals("/dir", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) pDir = args[i + 1].ToLowerInvariant();
                     }
-                    if (serial.Length == 0) { sb.AppendLine("用法：/phone /ip 192.168.1.50:5555 /preset loss45|offline|normal"); Console.WriteLine(sb); return 2; }
+                    if (serial.Length == 0)
+                    {
+                        sb.AppendLine("用法：/phone /ip 192.168.1.50:5555 /preset normal|loss|delay|delayloss|offline [/ms 300] [/loss 30] [/dir both|up|down] [/seconds 20]");
+                        Console.WriteLine(sb);
+                        return 2;
+                    }
                     if (!serial.Contains(":")) serial += ":5555";
+                    if (preset.StartsWith("loss") && preset.Length > 4)
+                    {
+                        int p2;
+                        if (int.TryParse(preset.Substring(4), out p2)) { lossPct = p2; preset = "loss"; }
+                    }
                     Phone.Connect(serial);
                     var info = Phone.Probe(serial);
                     sb.AppendLine("设备 " + info.Serial + "  连接=" + info.Connected + "  型号=" + info.Model + "  Android=" + info.Android + "  root=" + info.RootState);
                     if (!info.Connected) { Console.WriteLine(sb); File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8); return 3; }
-                    if (!info.Root) { sb.AppendLine("没有 root，无法下发 iptables"); Console.WriteLine(sb); File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8); return 4; }
-                    sb.AppendLine("结果：" + Phone.ApplyPreset(info, preset));
-                    Console.WriteLine(sb);
-                    File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8);
+                    bool needRoot = preset == "offline" || ((preset == "loss" || preset == "delayloss") && lossPct > 0);
+                    if (needRoot && !info.Root)
+                    {
+                        sb.AppendLine("没有 root：丢包/断网无法下发（只测时延可用 /preset delay）");
+                        Console.WriteLine(sb);
+                        File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8);
+                        return 4;
+                    }
+                    DelayProxy px = null;
+                    try
+                    {
+                        if (needRoot) sb.AppendLine("设备内：" + Phone.ApplyDevicePreset(info, preset == "offline" ? "offline" : "loss", lossPct));
+                        if (preset == "delay" || preset == "delayloss")
+                        {
+                            string hostIp = DelayProxy.HostIpForPeer(serial.Split(':')[0]);
+                            px = new DelayProxy();
+                            px.DelayMs = pMs;
+                            px.Up = pDir != "down";
+                            px.Down = pDir != "up";
+                            px.LossPercent = (preset == "delayloss" && !info.Root) ? lossPct : 0;
+                            string err;
+                            if (!px.Start(out err)) { sb.AppendLine("代理启动失败：" + err); Console.WriteLine(sb); return 5; }
+                            DelayProxy.EnsureFirewallRule(px.Port);
+                            string spec = hostIp + ":" + px.Port;
+                            Phone.SetGlobalProxy(serial, spec);
+                            sb.AppendLine("本机代理 " + spec + "：时延 " + pMs + "ms " + (px.Up && px.Down ? "上下行" : (px.Up ? "仅上行" : "仅下行")) + (px.LossPercent > 0 ? "，丢包 " + px.LossPercent + "%" : ""));
+                            sb.AppendLine("设备全局代理现在 = " + Phone.GetGlobalProxy(serial));
+                        }
+                        Console.WriteLine(sb);
+                        File.AppendAllText(App.LogPath, sb.ToString(), Encoding.UTF8);
+                        if (pSeconds > 0)
+                        {
+                            for (int i = 0; i < pSeconds; i++)
+                            {
+                                Thread.Sleep(1000);
+                                if (px != null && i % 3 == 2)
+                                    Console.WriteLine("  代理：连接 " + px.Connections + " 上行 " + (px.BytesUp / 1024) + "KB 下行 " + (px.BytesDown / 1024) + "KB");
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (px != null)
+                        {
+                            px.Stop();
+                            Phone.ClearGlobalProxy(serial);
+                            Console.WriteLine("已清理：本机代理关闭 + 设备全局代理复位");
+                        }
+                    }
                     return 0;
                 }
                 if (args.Length > 0 && args[0].Equals("/ports", StringComparison.OrdinalIgnoreCase))
@@ -1009,8 +1328,25 @@ namespace MuMuNetSim
         Label lblPhoneStatus;
         ComboBox cmbPhonePreset;
         Button btnPhoneConnect, btnPhoneDisconnect, btnPhoneApply, btnPhoneNormal;
+        TextBox txtPhoneLoss, txtPhoneMs;
+        CheckBox chkPhoneUp, chkPhoneDown;
+        DelayProxy _proxy;
         PhoneInfo _phone;
         DateTime _phoneProbeAt = DateTime.MinValue;
+
+        static readonly string[] PhonePresets = { "正常", "丢包", "时延", "时延+丢包", "断网" };
+
+        static string PhonePresetKey(string name)
+        {
+            switch (name)
+            {
+                case "丢包": return "loss";
+                case "时延": return "delay";
+                case "时延+丢包": return "delayloss";
+                case "断网": return "offline";
+                default: return "normal";
+            }
+        }
         System.Windows.Forms.Timer timer;
 
         readonly ConcurrentDictionary<int, string> _applied = new ConcurrentDictionary<int, string>();
@@ -1174,45 +1510,80 @@ namespace MuMuNetSim
 
             var lblP2 = new Label();
             lblP2.Text = "预设环境：";
-            lblP2.SetBounds(12, 114, 80, 22);
+            lblP2.SetBounds(12, 108, 80, 22);
             lblP2.Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Bold);
             tab2.Controls.Add(lblP2);
 
             cmbPhonePreset = new ComboBox();
             cmbPhonePreset.DropDownStyle = ComboBoxStyle.DropDownList;
-            cmbPhonePreset.SetBounds(98, 110, 190, 26);
-            cmbPhonePreset.Items.AddRange(Presets.Names);
+            cmbPhonePreset.SetBounds(98, 104, 150, 26);
+            cmbPhonePreset.Items.AddRange(PhonePresets);
             cmbPhonePreset.SelectedIndex = 0;
+            cmbPhonePreset.SelectedIndexChanged += delegate { PhonePresetChanged(); };
             tab2.Controls.Add(cmbPhonePreset);
+
+            var lblLoss = new Label();
+            lblLoss.Text = "丢包 %：";
+            lblLoss.SetBounds(258, 108, 56, 22);
+            tab2.Controls.Add(lblLoss);
+
+            txtPhoneLoss = new TextBox();
+            txtPhoneLoss.Text = "30";
+            txtPhoneLoss.SetBounds(314, 104, 54, 24);
+            tab2.Controls.Add(txtPhoneLoss);
+
+            var lblMs = new Label();
+            lblMs.Text = "时延 ms：";
+            lblMs.SetBounds(376, 108, 60, 22);
+            tab2.Controls.Add(lblMs);
+
+            txtPhoneMs = new TextBox();
+            txtPhoneMs.Text = "300";
+            txtPhoneMs.SetBounds(438, 104, 60, 24);
+            tab2.Controls.Add(txtPhoneMs);
+
+            chkPhoneUp = new CheckBox();
+            chkPhoneUp.Text = "上行";
+            chkPhoneUp.Checked = true;
+            chkPhoneUp.SetBounds(508, 106, 56, 22);
+            tab2.Controls.Add(chkPhoneUp);
+
+            chkPhoneDown = new CheckBox();
+            chkPhoneDown.Text = "下行";
+            chkPhoneDown.Checked = true;
+            chkPhoneDown.SetBounds(566, 106, 56, 22);
+            tab2.Controls.Add(chkPhoneDown);
 
             btnPhoneApply = new Button();
             btnPhoneApply.Text = "应用到手机";
-            btnPhoneApply.SetBounds(298, 109, 104, 28);
+            btnPhoneApply.SetBounds(632, 103, 100, 28);
             btnPhoneApply.Click += delegate { PhoneApply(); };
             tab2.Controls.Add(btnPhoneApply);
 
             btnPhoneNormal = new Button();
             btnPhoneNormal.Text = "恢复正常";
-            btnPhoneNormal.SetBounds(408, 109, 90, 28);
+            btnPhoneNormal.SetBounds(738, 103, 90, 28);
             btnPhoneNormal.Click += delegate { PhoneNormal(); };
             tab2.Controls.Add(btnPhoneNormal);
 
             var lblPHint = new Label();
-            lblPHint.SetBounds(12, 150, 830, 250);
+            lblPHint.SetBounds(12, 142, 830, 262);
             lblPHint.ForeColor = Color.DimGray;
             lblPHint.Text =
-                "手机端的弱网/断网是在手机内部下发 iptables 规则实现的（和 MuMu 实例一样的做法），\r\n" +
-                "因此：\r\n" +
-                "  1. 手机需要 root（adb shell su 可用）。没有 root 时本页只能看连接状态，无法改网络。\r\n" +
-                "  2. 支持：丢包档位（15%~100%）、断网。会一直放行 adb 端口，所以随时能点「恢复正常」。\r\n" +
-                "  3. 不支持延迟：手机的流量不经过本机，宿主机侧的抓包引擎碰不到它；\r\n" +
-                "     想要延迟可以把手机连到本机开的移动热点上，再用「MuMu 实例」页的全局弱网（clumsy）。\r\n" +
-                "  4. 恢复方式：点「恢复正常」，或重启手机（规则不落盘）。\r\n" +
+                "手机侧两种干预方式（可叠加）：\r\n" +
+                "  · 丢包 / 断网 → 在手机内部下发 iptables（独立链 MT_OUT），精确、可逆，需要 root；\r\n" +
+                "  · 时延（可加丢包）→ 本工具在本机起一个「延迟代理」，再用 adb 把手机的全局 HTTP 代理指过来，\r\n" +
+                "    免 root。此时手机的上网流量走本机代理：上行=手机→服务器，下行=服务器→手机，各方向可单独设。\r\n" +
+                "    注意：只有「遵守系统代理」的流量会受影响（浏览器、WebView、多数 App 的网络库）；\r\n" +
+                "    游戏用原始 UDP、或自实现网络栈、或证书校验写死 IP 的 App 可能不受影响。\r\n" +
+                "    这类要测全流量时延，请把手机连到本机开的移动热点，再用「MuMu 实例」页的全局引擎。\r\n" +
                 "\r\n" +
                 "连接步骤（手机与电脑同一 Wi-Fi）：\r\n" +
-                "  Android 11+：开发者选项 → 无线调试 → 使用配对码配对设备（首次）→ 无线调试页能看到 IP:端口\r\n" +
+                "  Android 11+：开发者选项 → 无线调试 → 用配对码配对（首次）→ 页面能看到 IP:端口\r\n" +
                 "  其它版本：USB 连线后执行  adb tcpip 5555  再拔线，用 手机IP:5555 连接\r\n" +
-                "  手机弹出「允许 USB 调试」时点允许。";
+                "  手机弹出「允许 USB 调试」时点允许。\r\n" +
+                "\r\n" +
+                "恢复：点「恢复正常」会同时清掉手机上的 iptables 规则与全局代理设置；关窗口也会自动清。";
             tab2.Controls.Add(lblPHint);
 
             timer = new System.Windows.Forms.Timer();
@@ -1221,8 +1592,23 @@ namespace MuMuNetSim
 
             Load += delegate
             {
+                if (!App.IsAdmin())
+                {
+                    Text = App.TITLE + "  —— 未提权：延迟功能不可用";
+                    Log("⚠ 当前不是管理员：每实例延迟需要 WinDivert 驱动，会报「拒绝访问」。请关掉后右键『以管理员身份运行』，或双击时点 UAC 的『是』。");
+                    Log("  （丢包/断网 仍然可用，它们只动模拟器内部的 iptables）");
+                }
                 Log("启动。管理员=" + App.IsAdmin() + "  WinDivert=" + (App.FindWinDivertDir() ?? "未找到"));
                 Log("预设/延迟配置：" + App.IniPath);
+                PhonePresetChanged();
+                var phoneCtl = new List<string>();
+                foreach (Control c in tab2.Controls)
+                {
+                    var tx = (c.Text ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+                    if (tx.Length == 0) continue;
+                    phoneCtl.Add(tx.Length > 14 ? tx.Substring(0, 14) : tx);
+                }
+                Log("手机页控件(" + tab2.Controls.Count + ")：" + string.Join(" | ", phoneCtl.ToArray()) + "　下拉项：" + string.Join(",", PhonePresets));
                 PollOnce(true);
                 timer.Start();
             };
@@ -1461,7 +1847,13 @@ namespace MuMuNetSim
             }
             var eng = new DelayEngine();
             eng.Instance = idx; eng.Ms = ms; eng.Up = up; eng.Down = down;
-            if (!eng.Start(filter, out err)) { UiLog("实例 " + idx + " 延迟引擎启动失败：" + err); return false; }
+            if (!eng.Start(filter, out err))
+            {
+                if (err.Contains("拒绝访问") || err.Contains("Access is denied") || err.Contains("5"))
+                    err += "（延迟需要管理员权限：请以管理员身份运行本工具）";
+                UiLog("实例 " + idx + " 延迟引擎启动失败：" + err);
+                return false;
+            }
             lock (_engineLock)
             {
                 DelayEngine old;
@@ -1614,7 +2006,7 @@ namespace MuMuNetSim
             if (p == null) { Log("还没连接"); return; }
             var th = new Thread(delegate()
             {
-                try { Phone.Clear(p); } catch { }
+                try { StopProxyAndClearPhoneProxy(p, true); } catch { }
                 Phone.Disconnect(p.Serial);
                 _phone = null;
                 _phoneProbeAt = DateTime.MinValue;
@@ -1629,19 +2021,83 @@ namespace MuMuNetSim
             th.Start();
         }
 
+        void PhonePresetChanged()
+        {
+            string key = PhonePresetKey(Convert.ToString(cmbPhonePreset.SelectedItem));
+            bool useLoss = (key == "loss" || key == "delayloss");
+            bool useMs = (key == "delay" || key == "delayloss");
+            txtPhoneLoss.Enabled = useLoss;
+            txtPhoneMs.Enabled = useMs;
+            chkPhoneUp.Enabled = useMs;
+            chkPhoneDown.Enabled = useMs;
+        }
+
+        void StopProxyAndClearPhoneProxy(PhoneInfo p, bool clearDevice)
+        {
+            try { if (_proxy != null) { _proxy.Stop(); _proxy = null; } } catch { }
+            try { if (p != null) Phone.ClearGlobalProxy(p.Serial); } catch { }
+            if (clearDevice) { try { if (p != null) Phone.Clear(p); } catch { } }
+        }
+
         void PhoneApply()
         {
             var p = _phone;
             if (p == null || !p.Connected) { Log("先在「手机 / 局域网设备」页点「连接」"); return; }
-            if (!p.Root) { Log("该手机没有 root，无法下发 iptables 规则（精确断网/丢包需要 root）"); return; }
-            string preset = Presets.KeyOfName(Convert.ToString(cmbPhonePreset.SelectedItem));
+            string key = PhonePresetKey(Convert.ToString(cmbPhonePreset.SelectedItem));
+            int lossPct = 0, ms = 0;
+            int.TryParse((txtPhoneLoss.Text ?? "").Trim(), out lossPct);
+            int.TryParse((txtPhoneMs.Text ?? "").Trim(), out ms);
+            bool up = chkPhoneUp.Checked, down = chkPhoneDown.Checked;
+            bool deviceLoss = (key == "offline") || (key == "loss") || (key == "delayloss");
+            if (deviceLoss && !p.Root)
+            {
+                if (key == "delayloss")
+                    Log("该手机没有 root：丢包只能交给本机代理做（时延+代理丢包），已按此执行");
+                else
+                {
+                    Log("该手机没有 root：丢包/断网需要在手机内部下发 iptables。只想测时延请选「时延」（走本机代理，免 root）");
+                    return;
+                }
+            }
+
             var th = new Thread(delegate()
             {
+                var desc = new List<string>();
                 try
                 {
-                    string desc = Phone.ApplyPreset(p, preset);
-                    UiLog("手机 " + p.Serial + " 已套用：" + desc);
-                    UI_PhoneApplied(desc);
+                    StopProxyAndClearPhoneProxy(p, false);
+                    if (deviceLoss && p.Root && key != "delay")
+                    {
+                        string d = Phone.ApplyDevicePreset(p, key == "offline" ? "offline" : "loss", lossPct);
+                        if (d != "正常") desc.Add(d);
+                    }
+                    if (key == "delay" || key == "delayloss")
+                    {
+                        if (ms <= 0) UiLog("时延要大于 0 才会生效");
+                        else
+                        {
+                            string peer = p.Serial.Split(':')[0];
+                            string hostIp = DelayProxy.HostIpForPeer(peer);
+                            var px = new DelayProxy();
+                            px.DelayMs = ms;
+                            px.Up = up;
+                            px.Down = down;
+                            px.LossPercent = (key == "delayloss" && !p.Root) ? Math.Max(0, Math.Min(100, lossPct)) : 0;
+                            string err;
+                            if (px.Start(out err))
+                            {
+                                _proxy = px;
+                                DelayProxy.EnsureFirewallRule(px.Port);
+                                string spec = hostIp + ":" + px.Port;
+                                Phone.SetGlobalProxy(p.Serial, spec);
+                                desc.Add("时延 " + ms + "ms(" + DirText(up, down) + ")@本机代理 " + spec);
+                            }
+                            else { UiLog("代理启动失败：" + err); desc.Add("时延失败"); }
+                        }
+                    }
+                    string text = desc.Count == 0 ? "正常" : string.Join(" + ", desc.ToArray());
+                    UiLog("手机 " + p.Serial + " 已套用：" + text);
+                    UI_PhoneApplied(text);
                 }
                 catch (Exception ex) { UiLog("手机套用失败：" + ex.Message); }
             });
@@ -1657,9 +2113,9 @@ namespace MuMuNetSim
             {
                 try
                 {
-                    Phone.Clear(p);
-                    cmbPhonePreset.SelectedIndex = 0;
-                    UiLog("手机 " + p.Serial + " 已恢复正常");
+                    StopProxyAndClearPhoneProxy(p, true);
+                    Ui(delegate() { cmbPhonePreset.SelectedIndex = 0; });
+                    UiLog("手机 " + p.Serial + " 已恢复正常（iptables 规则 + 全局代理都已清）");
                     UI_PhoneApplied("正常");
                 }
                 catch (Exception ex) { UiLog("恢复正常失败：" + ex.Message); }
@@ -1673,8 +2129,14 @@ namespace MuMuNetSim
             Ui(delegate()
             {
                 if (_phone != null && _phone.Connected)
-                    lblPhoneStatus.Text = PhoneStatusText(_phone) + "　已套用：" + desc;
+                    lblPhoneStatus.Text = PhoneStatusText(_phone) + "　已套用：" + desc + ProxyInfo();
             });
+        }
+
+        string ProxyInfo()        {
+            var px = _proxy;
+            if (px == null) return "";
+            return "　[代理 :" + px.Port + " 连接 " + px.Connections + " 上行 " + (px.BytesUp / 1024) + "KB 下行 " + (px.BytesDown / 1024) + "KB]";
         }
 
         void RefreshPhone()
@@ -1690,7 +2152,7 @@ namespace MuMuNetSim
                 _phoneProbeAt = DateTime.Now;
                 Ui(delegate()
                 {
-                    lblPhoneStatus.Text = PhoneStatusText(info);
+                    lblPhoneStatus.Text = PhoneStatusText(info) + ProxyInfo();
                     lblPhoneStatus.ForeColor = info.Connected ? Color.Green : Color.Firebrick;
                 });
             }
@@ -1722,6 +2184,8 @@ namespace MuMuNetSim
                 lock (_engineLock) { foreach (var kv in _engines) { try { kv.Value.Stop(); } catch { } } _engines.Clear(); }
                 foreach (var idx in _applied.Keys.ToList()) { try { Engine.ClearRules(idx); } catch { } }
                 Engine.StopClumsy();
+                // 手机：必须清掉全局代理，否则手机断网（代理没了）
+                try { StopProxyAndClearPhoneProxy(_phone, false); } catch { }
             }
             catch { }
             base.OnFormClosing(e);
@@ -1730,6 +2194,8 @@ namespace MuMuNetSim
 
     static class Program
     {
+        static System.Threading.Mutex _singleInstance;
+
         [STAThread]
         static int Main(string[] args)
         {
@@ -1764,6 +2230,19 @@ namespace MuMuNetSim
             }
 
             if (isCli) return Cli.Run(args);
+
+            // 单实例保护：两个窗口同时跑会互相顶（都在轮询、都套预设）
+            string mutexName = "Global\\MuMuNetSim_SingleInstance";
+            var altMutex = Environment.GetEnvironmentVariable("MUMUNETSIM_MUTEX");
+            if (!string.IsNullOrEmpty(altMutex)) mutexName = "Global\\MuMuNetSim_" + altMutex;
+            bool createdNew;
+            _singleInstance = new System.Threading.Mutex(true, mutexName, out createdNew);
+            if (!createdNew)
+            {
+                MessageBox.Show("已经有一个 MuMuNetSim 在运行。\r\n两个窗口同时开会互相顶（都轮询、都套预设），请先关掉另一个。",
+                    App.TITLE, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return 0;
+            }
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
