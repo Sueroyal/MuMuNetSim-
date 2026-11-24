@@ -35,7 +35,7 @@ namespace MuMuNetSim
     public static class App
     {
         public const string TAG = "mumu-net";
-        public const string TITLE = "MuMu 弱网 / 断网模拟器  v1.2";
+        public const string TITLE = "MuMu 弱网 / 断网模拟器  v1.3";
 
         public static string BaseDir = Path.GetDirectoryName(Application.ExecutablePath);
         public static string IniPath = Path.Combine(BaseDir, "MuMuNetSim.ini");

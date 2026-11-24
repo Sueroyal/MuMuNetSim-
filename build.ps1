@@ -9,7 +9,8 @@
 [CmdletBinding()]
 param(
     [switch]$SkipClumsy,
-    [switch]$ForceClumsy
+    [switch]$ForceClumsy,
+    [switch]$Package          # 额外打出 dist\MuMuNetSim-<版本>.zip 供分发
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +18,11 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root 'dist\MuMuNetSim'
 $src = Join-Path $root 'src\MuMuNetSim.cs'
 $outExe = Join-Path $dist 'MuMuNetSim.exe'
+
+# 版本号从源码里的标题抓，避免两处不一致
+$ver = 'v0.0'
+$m = Select-String -Path $src -Pattern 'TITLE\s*=\s*"[^"]*?(v[\d.]+)"' | Select-Object -First 1
+if ($m -and $m.Matches.Count -gt 0) { $ver = $m.Matches[0].Groups[1].Value }
 
 function Find-Csc {
     $cands = @(
@@ -90,9 +96,40 @@ MuMuNetSim.exe /status
 MuMuNetSim.exe /where
 
 日志：%TEMP%\MuMuNetSim.log
+
+分发给同事（小组内使用）
+------------------------
+1. 把整个 MuMuNetSim 文件夹（本说明同目录）压缩后拷给对方，解压后双击 MuMuNetSim.exe 即可。
+   无需安装任何东西：.NET Framework 4.x 是 Win10/11 自带，clumsy 与 WinDivert 已在 clumsy\ 子目录里。
+2. 对方机器上需要有 MuMu Player 12；程序会自动到 Program Files / D 盘等常见位置找 MuMuManager.exe。
+   找不到时可在 MuMuNetSim.ini 里加一行 mumumanager=<路径>。
+3. 首次运行会弹 UAC，点是（延迟引擎要用 WinDivert 驱动；提权后 clumsy 也能静默启停）。
+4. 每个人的预设都存在同目录 MuMuNetSim.ini 里，可以直接把这份 ini 拷给同事，
+   等于把「一套实例网络配方」一起发出去（preset.<实例号> / delay.<实例号> / up.<实例号> / down.<实例号>）。
+5. 若程序目录只读或路径含特殊字符导致 ini 写不了，程序照常工作，只是配置不会保存。
+
+典型用法
+--------
+· 测某实例在弱网下的表现：给它填 延迟 300、勾上/下行，或选 丢包 45%。
+· 测断线重连：预设选「断网」，点「启动实例」→ 实例起来就自动断网；再选「正常」立刻恢复。
+· 多开对比：实例 4 给 200ms、实例 5 给 800ms、实例 0 给 丢包 60%，三台同时跑不同网络环境。
 '@
 Set-Content -Path (Join-Path $dist '使用说明.txt') -Value $txt -Encoding UTF8
 
+if ($Package) {
+    Write-Host "[4/4] 打包发布 zip（不含本机 MuMuNetSim.ini）"
+    $stage = Join-Path $root 'dist\pkg\MuMuNetSim'
+    if (Test-Path (Join-Path $root 'dist\pkg')) { Remove-Item (Join-Path $root 'dist\pkg') -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    Copy-Item $outExe $stage -Force
+    Copy-Item (Join-Path $dist '使用说明.txt') $stage -Force
+    Copy-Item (Join-Path $dist 'clumsy') (Join-Path $stage 'clumsy') -Recurse -Force
+    $zip = Join-Path $root ('dist\MuMuNetSim-' + $ver + '.zip')
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
+    Write-Host ("      -> " + $zip + "  " + [math]::Round((Get-Item $zip).Length / 1KB, 1) + " KB（解压后双击 MuMuNetSim.exe）")
+}
+
 Write-Host ""
-Write-Host "构建完成：$dist"
+Write-Host "构建完成（$ver）：$dist"
 Get-ChildItem $dist -Recurse -File | Select-Object @{ n = '文件'; e = { $_.FullName.Substring($dist.Length + 1) } }, Length | Format-Table -Auto
