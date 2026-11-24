@@ -32,7 +32,7 @@ New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
 Write-Host "[1/3] 编译 $src"
 $csc = Find-Csc
-& $csc /nologo /codepage:65001 /target:winexe /optimize+ "/out:$outExe" /r:System.Windows.Forms.dll /r:System.Drawing.dll $src
+& $csc /nologo /codepage:65001 /target:winexe /optimize+ "/out:$outExe" /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll $src
 if ($LASTEXITCODE -ne 0) { throw "编译失败（exit $LASTEXITCODE）" }
 Write-Host ("      -> " + $outExe + "  " + (Get-Item $outExe).Length + " bytes")
 
@@ -53,34 +53,42 @@ MuMu 弱网 / 断网模拟器 (MuMuNetSim)
 
 用法
 ----
-1. 双击 MuMuNetSim.exe（会请求管理员权限，这是为了让 clumsy 在需要时能静默启动/关闭）。
-2. 上面下拉框选择环境：
-     正常（不干预网络）
-     弱网 · 延迟 200ms + 丢包 5%（clumsy，作用于整机出站）
-     弱网 · 丢包 15%（仅该实例，走实例内 iptables）
-     断网 · 完全不通（仅该实例）
-   选完立即生效，再选「正常」即恢复。关闭窗口也会自动恢复。
-3. 「目标实例」下拉框可切换 MuMu 实例（默认第一个运行中的实例），点「刷新」重新扫描。
+1. 双击 MuMuNetSim.exe（首次会请求管理员权限：延迟引擎用 WinDivert 驱动，必须提权；
+   提权一次后 clumsy 也能静默启动/关闭）。
+2. 表格里每个实例一行，可分别预设：
+     预设环境   ：正常 / 丢包 15%、25%、35%、45%、55%、65%、75%、80% / 断网
+     延迟ms     ：自己填，0 表示不加延迟（1~10000）
+     上行/下行  ：勾选延迟作用的方向（只勾一个就是单向延迟）
+   改完立刻生效；实例没启动也没关系，启动后会自动套用。
+3. 行尾「操作」列可以一键启动 / 关闭该实例；「全部恢复正常」清空所有实例的网络干预。
+4. 关闭窗口会自动恢复正常（清 iptables 规则 + 关延迟引擎 + 关 clumsy）。
+
+延迟是怎么做的（重要）
+----------------------
+· 断网 / 丢包：在模拟器实例内部下发 iptables 规则，只影响这一个实例，秒级生效，
+  规则不落盘（重启实例即清空），并且始终放行 adb 通道，所以随时能恢复。
+· 延迟：宿主机侧用 WinDivert（clumsy 同款驱动，随本程序分发）抓包再延时重发。
+  每个实例一个独立引擎，按「该实例 VMM 进程(MuMuVMMHeadless)占用的 TCP/UDP 端口」过滤，
+  所以多个实例可以同时设不同延迟；新出现的连接最多 3 秒后自动纳入。
+  注意：模拟器内部的 ping(ICMP) 不走 NAT 端口，因此不会被延迟，游戏/应用的 TCP/UDP 会。
+· 「全局弱网(clumsy)」是整机出站的粗粒度选项，和每实例延迟互斥（会互相顶掉）。
 
 目录
 ----
 MuMuNetSim.exe      主程序（单文件，.NET Framework 4.x）
-clumsy\             官方 clumsy 0.3（延迟/丢包/限速引擎，来自 github.com/jagt/clumsy）
+clumsy\             官方 clumsy 0.3 + WinDivert 2.2（延迟引擎用这里的 WinDivert.dll/.sys）
+MuMuNetSim.ini      你的预设（每个实例的 预设环境 / 延迟 / 上下行，自动保存）
 
 命令行（便于脚本/自动化）
 ------------------------
-MuMuNetSim.exe /apply normal|offline|weak|weak-guest [/instance 4] [/noelevate]
+MuMuNetSim.exe /apply normal|offline|loss15|loss45|loss80 [/instance 4] [/noelevate]
+MuMuNetSim.exe /delay /instance 4 /ms 300 /dir both|up|down [/seconds 15]
+MuMuNetSim.exe /delay /filter "icmp and ip.DstAddr == 8.8.8.8" /ms 800 /dir up /seconds 20
+MuMuNetSim.exe /ports          # 只看每实例构造出来的 WinDivert 过滤器（不用提权）
 MuMuNetSim.exe /status
 MuMuNetSim.exe /where
 
-说明
-----
-· 「断网」「弱网（丢包）」是在模拟器实例内部下发 iptables 规则实现，只影响该实例，
-  并且保留 adb 通道，所以随时可以切回「正常」；规则不落盘，重启实例即清空。
-· 「弱网（延迟）」只能由宿主机的 clumsy 实现（Windows 上按进程做延迟需要未公开的驱动能力），
-  因此它的过滤器是 outbound and ip：会同时影响宿主机其它程序的出站流量，
-  本机回环 127.0.0.1（含桌面端/网页端工具）不受影响。clumsy 10 分钟后会自动退出。
-· 日志：%TEMP%\MuMuNetSim.log
+日志：%TEMP%\MuMuNetSim.log
 '@
 Set-Content -Path (Join-Path $dist '使用说明.txt') -Value $txt -Encoding UTF8
 
