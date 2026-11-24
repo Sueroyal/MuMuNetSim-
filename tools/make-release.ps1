@@ -60,7 +60,7 @@ $notes = @"
 MuMu 模拟器单实例 / 局域网手机的**弱网、断网、延迟**模拟工具。下载即用，零安装。
 
 ### 下载哪个
-- **MuMuNetSim-$Tag-单文件版.zip**（推荐）：解压得到**一个 exe**，首次运行自动解包内置的
+- **MuMuNetSim-$Tag-single.zip**（推荐）：解压得到**一个 exe**，首次运行自动解包内置的
   adb（platform-tools）与 clumsy/WinDivert。放到共享盘、IM 发同事都行。
 - **MuMuNetSim-$Tag.zip**：目录版（exe + ``adb\`` + ``clumsy\`` + 使用说明 + 第三方许可）。
 
@@ -88,7 +88,7 @@ $($hashLines -join "`r`n")
 "@
 
 $notesFile = Join-Path $env:TEMP 'mumunetsim_release_notes.md'
-Set-Content -Path $notesFile -Value $notes -Encoding UTF8
+[System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))
 
 Log "创建/更新 Release $Tag …"
 $exists = (& $gh release view $Tag -R $Repo 2>&1 | Out-String)
