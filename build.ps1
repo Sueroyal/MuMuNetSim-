@@ -187,7 +187,7 @@ if ($Single) {
     Write-Host "      -> $singleExe  $size KB"
 
     if ($Package) {
-        $zip = Join-Path $root ('dist\MuMuNetSim-' + $ver + '-单文件版.zip')
+        $zip = Join-Path $root ('dist\MuMuNetSim-' + $ver + '-single.zip')
         Remove-Item $zip -Force -ErrorAction SilentlyContinue
         Compress-Archive -Path $singleExe -DestinationPath $zip -CompressionLevel Optimal
         Write-Host ("      -> 已打包 " + $zip + "  " + [math]::Round((Get-Item $zip).Length / 1KB, 1) + " KB")
