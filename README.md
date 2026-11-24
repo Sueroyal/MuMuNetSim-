@@ -18,7 +18,7 @@
 | 干预 | 实现 | 影响范围 | 说明 |
 |---|---|---|---|
 | **断网** | 实例内 `iptables`（双向 DROP） | **仅该实例** | 放行 `lo` + adb 端口，所以断网中也能一键恢复；规则不落盘，重启实例即清空 |
-| **丢包 15%~80%（步长 10）** | 实例内 `iptables -m statistic --mode random` | **仅该实例** | 秒级生效；实测 30% 档位 20 包样本得到 36% |
+| **丢包 15%~100%（步长 10）** | 实例内 `iptables -m statistic --mode random` | **仅该实例** | 秒级生效；30% 档位实测 20 包样本得到 36%；100% 档 = 出方向全丢（近似断网，但不拦入方向） |
 | **延迟 X ms（上行/下行可选）** | 宿主机 WinDivert 抓包 → 定时重发 | **仅该实例** | 每实例一个独立引擎；过滤器 = 该实例 `MuMuVMMHeadless.exe` 占用的 TCP/UDP 端口 |
 | 全局弱网（clumsy，可选） | 调 `clumsy.exe --filter "outbound and ip"` | 整机出站 | 粗粒度兜底；与每实例延迟互斥 |
 
@@ -61,7 +61,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 ## 命令行 / 自动化
 
 ```powershell
-MuMuNetSim.exe /apply normal|offline|loss15|loss45|loss80 [/instance 4] [/noelevate]
+MuMuNetSim.exe /apply normal|offline|loss15|loss45|loss80|loss100 [/instance 4] [/noelevate]
 MuMuNetSim.exe /delay /instance 4 /ms 300 /dir both|up|down [/seconds 15]
 MuMuNetSim.exe /delay /filter "icmp and ip.DstAddr == 8.8.8.8" /ms 800 /dir up /seconds 20
 MuMuNetSim.exe /ports            # 打印每个实例构造出来的 WinDivert 过滤器（免提权，用来验证映射）

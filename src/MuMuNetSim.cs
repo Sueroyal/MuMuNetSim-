@@ -676,8 +676,8 @@ namespace MuMuNetSim
 
     public static class Presets
     {
-        // 丢包档位：15~80，步长 10
-        public static readonly int[] LossTiers = { 15, 25, 35, 45, 55, 65, 75, 80 };
+        // 丢包档位：15~100（步长 10，末档 100% 即全丢）
+        public static readonly int[] LossTiers = { 15, 25, 35, 45, 55, 65, 75, 80, 90, 100 };
         public static readonly string[] Names;
         public static readonly string[] Keys;
 
