@@ -1,5 +1,5 @@
 ﻿// MuMuNetSim - MuMu 模拟器弱网 / 断网模拟器（单文件 WinForms）
-// 编译：powershell -File build.ps1
+// 编译：powershell -File build.ps1   （或 csc /target:winexe /codepage:65001 ...）
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -17,6 +17,13 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+
+[assembly: System.Reflection.AssemblyTitle("MuMuNetSim")]
+[assembly: System.Reflection.AssemblyProduct("MuMu 弱网 / 断网模拟器")]
+[assembly: System.Reflection.AssemblyDescription("MuMu 模拟器实例 / 局域网手机的弱网、断网、延迟模拟")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("v1.4")]
 
 namespace MuMuNetSim
 {
@@ -52,12 +59,16 @@ namespace MuMuNetSim
         // ---------------------------------------------------------- 单文件版的资源解包
 
         static readonly string[][] Assets = new string[][] {
-            new string[] { "asset.clumsy.exe",      @"clumsy\clumsy.exe" },
-            new string[] { "asset.WinDivert.dll",   @"clumsy\WinDivert.dll" },
-            new string[] { "asset.WinDivert64.sys", @"clumsy\WinDivert64.sys" },
-            new string[] { "asset.config.txt",      @"clumsy\config.txt" },
-            new string[] { "asset.License.txt",     @"clumsy\License.txt" },
-            new string[] { "asset.readme.txt",      "使用说明.txt" }
+            new string[] { "asset.clumsy.exe",        @"clumsy\clumsy.exe" },
+            new string[] { "asset.WinDivert.dll",     @"clumsy\WinDivert.dll" },
+            new string[] { "asset.WinDivert64.sys",   @"clumsy\WinDivert64.sys" },
+            new string[] { "asset.config.txt",        @"clumsy\config.txt" },
+            new string[] { "asset.clumsy-license.txt",@"clumsy\License.txt" },
+            new string[] { "asset.adb.exe",           @"adb\adb.exe" },
+            new string[] { "asset.AdbWinApi.dll",     @"adb\AdbWinApi.dll" },
+            new string[] { "asset.AdbWinUsbApi.dll",  @"adb\AdbWinUsbApi.dll" },
+            new string[] { "asset.thirdparty.txt",    "第三方组件与许可.txt" },
+            new string[] { "asset.readme.txt",        "使用说明.txt" }
         };
 
         public static bool DirWritable(string dir)
@@ -102,13 +113,16 @@ namespace MuMuNetSim
                     var target = Path.Combine(home, pair[1]);
                     var targetDir = Path.GetDirectoryName(target);
                     if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
-                    // 使用说明只在缺失时写；二进制按大小校验后覆盖
-                    bool skip = File.Exists(target) && pair[1].EndsWith("使用说明.txt", StringComparison.Ordinal);
-                    if (skip) continue;
                     using (var s = asm.GetManifestResourceStream(resName))
-                    using (var f = File.Create(target))
                     {
-                        s.CopyTo(f);
+                        // 使用说明/许可：缺失时才写；二进制按大小一致就跳过（避免每次启动重写 ~10MB）
+                        bool text = pair[1].EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
+                        if (File.Exists(target))
+                        {
+                            if (text) continue;
+                            if (new FileInfo(target).Length == s.Length) continue;
+                        }
+                        using (var f = File.Create(target)) s.CopyTo(f);
                     }
                 }
                 Log("单文件版：资产已解包到 " + home);
@@ -183,26 +197,96 @@ namespace MuMuNetSim
 
         public static string FindMuMuManager()
         {
-            if (!string.IsNullOrEmpty(MuMuManagerPath) && File.Exists(MuMuManagerPath)) return MuMuManagerPath;
+            if (!string.IsNullOrEmpty(MuMuManagerPath) && File.Exists(MuMuManagerPath)) { MuMuManagerSource = "ini 配置"; return MuMuManagerPath; }
             var pf = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
             var pf86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+            // 1) 常见安装路径
             var cands = new List<string>();
             cands.Add(Path.Combine(pf, @"Netease\MuMu\nx_main\MuMuManager.exe"));
             cands.Add(Path.Combine(pf86, @"Netease\MuMu\nx_main\MuMuManager.exe"));
-            cands.Add(@"D:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe");
-            foreach (var c in cands) if (File.Exists(c)) { MuMuManagerPath = c; return c; }
-            foreach (var root in new[] { pf + @"\Netease\MuMu", @"D:\Program Files\Netease\MuMu" })
+            foreach (var d in DriveInfo.GetDrives())
             {
                 try
                 {
-                    if (!Directory.Exists(root)) continue;
-                    var f = Directory.GetFiles(root, "MuMuManager.exe", SearchOption.AllDirectories).FirstOrDefault();
-                    if (f != null) { MuMuManagerPath = f; return f; }
+                    if (d.DriveType != DriveType.Fixed && d.DriveType != DriveType.Network) continue;
+                    cands.Add(Path.Combine(d.RootDirectory.FullName, @"Program Files\Netease\MuMu\nx_main\MuMuManager.exe"));
+                    cands.Add(Path.Combine(d.RootDirectory.FullName, @"Netease\MuMu\nx_main\MuMuManager.exe"));
                 }
                 catch { }
             }
+            foreach (var c in cands) if (File.Exists(c)) { MuMuManagerPath = c; MuMuManagerSource = "常见安装路径"; return c; }
+
+            // 2) 从正在运行的 MuMu 进程反推安装目录（最通用）
+            foreach (var pn in new[] { "MuMuNxMain", "MuMuNxService", "MuMuNxDevice" })
+            {
+                try
+                {
+                    foreach (var pr in Process.GetProcessesByName(pn))
+                    {
+                        try
+                        {
+                            var exe = pr.MainModule.FileName;
+                            var dir = Path.GetDirectoryName(exe);
+                            for (int up = 0; up < 3 && dir != null; up++)
+                            {
+                                var f = Path.Combine(dir, "MuMuManager.exe");
+                                if (File.Exists(f)) { MuMuManagerPath = f; MuMuManagerSource = "从运行中的 " + pn + " 反推"; return f; }
+                                dir = Path.GetDirectoryName(dir);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+            }
+
+            // 3) 注册表卸载项
+            try
+            {
+                foreach (var root in new[] { @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall", @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall" })
+                {
+                    foreach (var hive in new[] { Microsoft.Win32.Registry.LocalMachine, Microsoft.Win32.Registry.CurrentUser })
+                    {
+                        using (var k = hive.OpenSubKey(root))
+                        {
+                            if (k == null) continue;
+                            foreach (var sn in k.GetSubKeyNames())
+                            {
+                                using (var sk = k.OpenSubKey(sn))
+                                {
+                                    if (sk == null) continue;
+                                    var dn = Convert.ToString(sk.GetValue("DisplayName")) ?? "";
+                                    if (dn.IndexOf("MuMu", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                                    var loc = Convert.ToString(sk.GetValue("InstallLocation")) ?? "";
+                                    if (loc.Length == 0) continue;
+                                    var f = Path.Combine(loc, @"nx_main\MuMuManager.exe");
+                                    if (!File.Exists(f)) f = Path.Combine(loc, @"MuMu\nx_main\MuMuManager.exe");
+                                    if (File.Exists(f)) { MuMuManagerPath = f; MuMuManagerSource = "注册表卸载项"; return f; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // 4) PATH
+            try
+            {
+                foreach (var d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
+                {
+                    if (string.IsNullOrWhiteSpace(d)) continue;
+                    var f = Path.Combine(d.Trim(), "MuMuManager.exe");
+                    if (File.Exists(f)) { MuMuManagerPath = f; MuMuManagerSource = "PATH"; return f; }
+                }
+            }
+            catch { }
+
             return null;
         }
+
+        public static string MuMuManagerSource = "";
 
         public static string FindClumsy()
         {
@@ -619,6 +703,76 @@ namespace MuMuNetSim
             return "(" + string.Join(" or ", parts.ToArray()) + ")";
         }
 
+        // 环境自检：用户点「刷新实例」或 /selfcheck 时输出，方便排查别人机器上的环境差异
+        public static List<string> SelfCheck()
+        {
+            var L = new List<string>();
+            L.Add("版本：" + App.TITLE + "　" + (Environment.Is64BitOperatingSystem ? "64 位系统 ✓" : "32 位系统 ✗（WinDivert 是 x64，延迟不可用）"));
+            L.Add("管理员：" + (App.IsAdmin() ? "是 ✓（延迟引擎、代理防火墙放行都可用）" : "否 ✗（延迟会报『拒绝访问』，需要右键以管理员身份运行；丢包/断网不受影响）"));
+            L.Add("程序目录：" + App.BaseDir + (string.IsNullOrEmpty(App.AssetDir) ? "" : "　单文件资产解包：" + App.AssetDir));
+            L.Add("ini：" + App.IniPath + "　日志：" + App.LogPath);
+
+            App.FindMuMuManager();
+            L.Add("MuMuManager：" + (App.MuMuManagerPath ?? "未找到 ✗（模拟器功能不可用，可点『定位 MuMu』手动指定）")
+                + (string.IsNullOrEmpty(App.MuMuManagerSource) ? "" : "　来源：" + App.MuMuManagerSource));
+
+            string adb = "adb";
+            try { adb = Phone.AdbPath(); } catch { }
+            string adbVer = "";
+            try
+            {
+                var o = Proc.Run(adb, "version", 8000);
+                adbVer = (o.Split('\n').FirstOrDefault(x => x.IndexOf("Android Debug Bridge", StringComparison.OrdinalIgnoreCase) >= 0) ?? "").Trim();
+            }
+            catch { }
+            L.Add("adb：" + adb + (adbVer.Length > 0 ? "　" + adbVer : "　（版本获取失败）"));
+
+            var wd = App.FindWinDivertDir();
+            if (wd == null) L.Add("WinDivert：未找到 ✗（延迟功能不可用）");
+            else
+                L.Add("WinDivert：" + wd + "　dll" + (File.Exists(Path.Combine(wd, "WinDivert.dll")) ? "✓" : "✗")
+                    + " 驱动" + (File.Exists(Path.Combine(wd, "WinDivert64.sys")) ? "✓" : "✗")
+                    + " 服务：" + DriverState());
+            L.Add("clumsy：" + (App.FindClumsy() ?? "未找到（全局弱网不可用）"));
+            L.Add("代理入站放行：MuMuNetSim Delay Proxy 8899 → " + (FirewallRuleExists("MuMuNetSim Delay Proxy 8899") ? "已存在 ✓" : "暂无（启动手机时延代理时会自动添加）"));
+
+            try
+            {
+                var insts = ListInstances();
+                var running = insts.Where(i => i.Running).ToList();
+                L.Add("MuMu 实例：共 " + insts.Count + " 个，运行中 " + running.Count + " 个"
+                    + (running.Count > 0 ? "（" + string.Join("、", running.Select(i => i.Index + "·" + i.Name).ToArray()) + "）" : ""));
+                var vmms = ListVmms();
+                L.Add("VMM 进程：" + (vmms.Count == 0 ? "无（实例没起来时属正常）" : string.Join("、", vmms.Select(v => "实例" + v.Instance + " pid=" + v.Pid).ToArray())));
+            }
+            catch (Exception ex) { L.Add("实例枚举失败：" + ex.Message); }
+            return L;
+        }
+
+        static string DriverState()
+        {
+            try
+            {
+                var o = Proc.Run(Path.Combine(Environment.SystemDirectory, "sc.exe"), "query WinDivert", 8000);
+                if (o.Contains("RUNNING")) return "已运行";
+                if (o.Contains("STOPPED")) return "已安装未启动";
+                if (o.Contains("1060") || o.Contains("does not exist") || o.Contains("指定的服务")) return "未安装（首次开启延迟时会自动装）";
+                return "未知";
+            }
+            catch { return "未知"; }
+        }
+
+        static bool FirewallRuleExists(string ruleName)
+        {
+            try
+            {
+                var o = Proc.Run(Path.Combine(Environment.SystemDirectory, "netsh.exe"),
+                    "advfirewall firewall show rule name=\"" + ruleName + "\"", 8000);
+                return o.Contains(ruleName);
+            }
+            catch { return false; }
+        }
+
         public static int ClearRules(int idx)
         {
             int removed = 0;
@@ -772,18 +926,26 @@ namespace MuMuNetSim
 
         public static string AdbPath()
         {
-            try
-            {
-                var dir = Path.GetDirectoryName(App.MuMuManagerPath ?? "");
-                if (!string.IsNullOrEmpty(dir))
-                {
-                    var p = Path.Combine(dir, "adb.exe");
-                    if (File.Exists(p)) return p;
-                }
-            }
-            catch { }
+            var cands = new List<string>();
+            // 1) 程序自带（单文件版解包 / 目录版 adb\）——包体自包含，不依赖本机有没有 MuMu / Android SDK
+            if (!string.IsNullOrEmpty(App.AssetDir)) cands.Add(Path.Combine(App.AssetDir, @"adb\adb.exe"));
+            cands.Add(Path.Combine(App.BaseDir, @"adb\adb.exe"));
+            // 2) 本机 Android SDK / 其它 adb
+            var sdk = Environment.GetEnvironmentVariable("ANDROID_HOME");
+            if (string.IsNullOrEmpty(sdk)) sdk = Environment.GetEnvironmentVariable("ANDROID_SDK_ROOT");
+            if (!string.IsNullOrEmpty(sdk)) cands.Add(Path.Combine(sdk, @"platform-tools\adb.exe"));
+            var lhd = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+            if (!string.IsNullOrEmpty(lhd)) cands.Add(Path.Combine(lhd, @"Android\Sdk\platform-tools\adb.exe"));
+            cands.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"AdbTools\adb\platform-tools\adb.exe"));
+            // 3) MuMu 自带
+            var mdir = Path.GetDirectoryName(App.MuMuManagerPath ?? "");
+            if (!string.IsNullOrEmpty(mdir)) cands.Add(Path.Combine(mdir, "adb.exe"));
+            foreach (var c in cands) if (File.Exists(c)) { AdbSource = c; return c; }
+            AdbSource = "PATH 里的 adb";
             return "adb";
         }
+
+        public static string AdbSource = "";
 
         static string Q(string s) { return "\"" + (s ?? "").Replace("\"", "\\\"") + "\""; }
         static string Run(string args, int timeoutMs) { return Proc.Run(AdbPath(), args, timeoutMs); }
@@ -1281,6 +1443,13 @@ namespace MuMuNetSim
                     }
                     return 0;
                 }
+                if (args.Length > 0 && args[0].Equals("/selfcheck", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var line in Engine.SelfCheck()) sb.AppendLine("  " + line);
+                    Console.WriteLine(sb.ToString());
+                    File.AppendAllText(App.LogPath, "---- /selfcheck ----" + Environment.NewLine + sb.ToString(), Encoding.UTF8);
+                    return 0;
+                }
                 if (args.Length > 0 && args[0].Equals("/ports", StringComparison.OrdinalIgnoreCase))
                 {
                     // 只看端口过滤器（不需要管理员）：验证实例 -> VMM 进程 -> 端口 的映射
@@ -1464,7 +1633,7 @@ namespace MuMuNetSim
             btnRefresh = new Button();
             btnRefresh.Text = "刷新实例";
             btnRefresh.SetBounds(14, 40, 92, 26);
-            btnRefresh.Click += delegate { PollOnce(true); };
+            btnRefresh.Click += delegate { SelfCheckAndRefresh(true); };
             Controls.Add(btnRefresh);
 
             btnAllNormal = new Button();
@@ -1684,7 +1853,9 @@ namespace MuMuNetSim
                     phoneCtl.Add(tx.Length > 14 ? tx.Substring(0, 14) : tx);
                 }
                 Log("手机页控件(" + tab2.Controls.Count + ")：" + string.Join(" | ", phoneCtl.ToArray()) + "　下拉项：" + string.Join(",", PhonePresets));
-                PollOnce(true);
+                if (!Environment.Is64BitOperatingSystem)
+                    Log("⚠ 本机是 32 位 Windows：延迟功能（WinDivert x64）不可用；丢包/断网仍可用。");
+                SelfCheckAndRefresh(false);
                 timer.Start();
             };
         }
@@ -1694,6 +1865,47 @@ namespace MuMuNetSim
             var c = new DataGridViewTextBoxColumn();
             c.HeaderText = header; c.Width = width; c.ReadOnly = true;
             return c;
+        }
+
+        // ------------------------------------------------------------ 环境自检 / 刷新
+
+        // 「刷新实例」= 重新扫描本机环境（MuMu 路径、adb、WinDivert、权限、实例、端口、手机）并同步界面
+        void SelfCheckAndRefresh(bool interactive)
+        {
+            var th = new Thread(delegate()
+            {
+                UiLog("---------------- 环境自检 / 刷新 ----------------");
+                try { foreach (var l in Engine.SelfCheck()) UiLog("  " + l); }
+                catch (Exception ex) { UiLog("  自检失败：" + ex.Message); }
+                if (interactive && string.IsNullOrEmpty(App.MuMuManagerPath))
+                    Ui(delegate() { OfferLocateMuMu(); });
+                PollOnce(true);
+            });
+            th.IsBackground = true;
+            th.Start();
+        }
+
+        void OfferLocateMuMu()
+        {
+            try
+            {
+                if (MessageBox.Show("没有找到 MuMuManager.exe（MuMu 模拟器的管理程序）。\r\n要现在手动定位它吗？",
+                        App.TITLE, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                using (var dlg = new OpenFileDialog())
+                {
+                    dlg.Title = "选择 MuMuManager.exe";
+                    dlg.Filter = "MuMuManager.exe|MuMuManager.exe|所有程序|*.exe";
+                    dlg.InitialDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Netease");
+                    if (dlg.ShowDialog(this) == DialogResult.OK)
+                    {
+                        App.MuMuManagerPath = dlg.FileName;
+                        App.MuMuManagerSource = "手动指定";
+                        App.SaveIni();
+                        UiLog("已指定 MuMuManager：" + dlg.FileName);
+                    }
+                }
+            }
+            catch (Exception ex) { UiLog("定位 MuMu 失败：" + ex.Message); }
         }
 
         // ------------------------------------------------------------ 轮询
@@ -2287,11 +2499,12 @@ namespace MuMuNetSim
             bool isWhere = args.Length > 0 && args[0].StartsWith("/where", StringComparison.OrdinalIgnoreCase);
             bool isPorts = args.Length > 0 && args[0].StartsWith("/ports", StringComparison.OrdinalIgnoreCase);
             bool isPhone = args.Length > 0 && args[0].StartsWith("/phone", StringComparison.OrdinalIgnoreCase);
+            bool isCheck = args.Length > 0 && args[0].StartsWith("/selfcheck", StringComparison.OrdinalIgnoreCase);
             bool isCli = args.Length > 0 && (args[0].StartsWith("/apply", StringComparison.OrdinalIgnoreCase)
-                || args[0].StartsWith("/delay", StringComparison.OrdinalIgnoreCase) || isStatus || isWhere || isPorts || isPhone);
+                || args[0].StartsWith("/delay", StringComparison.OrdinalIgnoreCase) || isStatus || isWhere || isPorts || isPhone || isCheck);
 
             // 延迟引擎要用 WinDivert 驱动，必须提权；GUI 也提权一次后 clumsy 才能静默
-            if (!App.IsAdmin() && !noElevate && !isStatus && !isWhere && !isPorts && !args.Any(a => a.Equals("/noelevate", StringComparison.OrdinalIgnoreCase)) && !isPhone)
+            if (!App.IsAdmin() && !noElevate && !isStatus && !isWhere && !isPorts && !isPhone && !isCheck)
             {
                 try
                 {

@@ -42,21 +42,70 @@
 ## 快速开始
 
 1. 双击 `MuMuNetSim.exe`（首次弹 UAC，点是）。
-2. 表格里给每个实例选好 **预设环境** / 填 **延迟ms** / 勾 **上行·下行**，改完立刻生效。
-3. 实例没启动也行：状态列显示「待启动」，实例一起来就自动套用；行尾按钮可直接启停实例。
+2. **点「刷新实例」**：自动扫描本机环境并同步界面（MuMu 安装位置、adb、WinDivert 驱动、权限、实例、端口、手机）。
+3. 表格里给每个实例选好 **预设环境** / 填 **延迟ms** / 勾 **上行·下行**，改完立刻生效；
+   实例没启动也行（显示「待启动」，实例一起来就自动套用），行尾按钮可直接启停实例。
 4. 关窗口或点「全部恢复正常」即恢复。
+
+## 包体内容（自包含，拿到就能用）
+
+**单文件版**（推荐分发）：只有一个 `MuMuNetSim.exe`，首次运行把内置资产解包到 exe 同目录
+（目录不可写时自动改用 `%LOCALAPPDATA%\MuMuNetSim`）：
+
+```
+MuMuNetSim.exe        主程序（含版本信息与图标）
+adb\      adb.exe + AdbWinApi.dll + AdbWinUsbApi.dll   ← 内置官方 platform-tools：手机功能不依赖本机 MuMu/Android SDK
+clumsy\   clumsy.exe + WinDivert.dll + WinDivert64.sys ← 全局弱网 + 延迟引擎的抓包驱动
+使用说明.txt / 第三方组件与许可.txt
+MuMuNetSim.ini        首次保存配置时生成
+```
+
+**目录版**：`MuMuNetSim.exe` + `clumsy\` + `adb\` + 两份说明，结构同上。
+
+要点：
+
+- **零安装**：.NET Framework 4.x 是 Win10/11 自带；adb、clumsy、WinDivert 全部随包。
+- **MuMu 装在哪都行**：依次按 `ini 配置 → 常见安装路径（扫描各盘符） → 运行中的 MuMu 进程反推 → 注册表卸载项 → PATH` 探测；
+  都没找到时会弹窗让你手动定位（写进 ini，只问一次）。
+- **只读位置也能跑**：exe 放在网络共享 / Program Files 时，资产与 ini 自动落到 `%LOCALAPPDATA%\MuMuNetSim`。
+- **32 位 Windows**：延迟引擎（WinDivert 为 x64）不可用，标题栏与自检里会明确说明；丢包/断网仍可用。
+
+## 环境自检（在别人机器上排障第一步）
+
+「刷新实例」= 全量环境自检 + 界面同步，日志里会输出一份可直接贴出来的报告；也可以命令行跑（免提权）：
+
+```powershell
+MuMuNetSim.exe /selfcheck
+```
+
+```
+版本：MuMu 弱网 / 断网模拟器  v1.4　64 位系统 ✓
+管理员：是 ✓（延迟引擎、代理防火墙放行都可用）
+程序目录：D:\tools\MuMuNetSim　单文件资产解包：D:\tools\MuMuNetSim
+ini：D:\tools\MuMuNetSim\MuMuNetSim.ini　日志：%TEMP%\MuMuNetSim.log
+MuMuManager：D:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe　来源：从运行中的 MuMuNxMain 反推
+adb：D:\tools\MuMuNetSim\adb\adb.exe　Android Debug Bridge version 1.0.41
+WinDivert：D:\tools\MuMuNetSim\clumsy　dll✓ 驱动✓ 服务：已运行
+clumsy：D:\tools\MuMuNetSim\clumsy\clumsy.exe
+代理入站放行：MuMuNetSim Delay Proxy 8899 → 暂无（启动手机时延代理时会自动添加）
+MuMu 实例：共 5 个，运行中 2 个（4·包体拆分、5·未包体拆分）
+VMM 进程：实例4 pid=65860、实例5 pid=60204
+```
 
 ## 构建
 
 ```powershell
 git clone --recurse-submodules <this-repo>
 cd MuMuNetSim
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1                  # 目录版
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Package         # 目录版 + zip
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1 -Single -Package  # 单文件版 + zip
 ```
 
-- `src/MuMuNetSim.cs` 用系统自带 `csc.exe`（.NET Framework 4.x）编译成 `dist/MuMuNetSim/MuMuNetSim.exe`；
-- `tools/get-clumsy.ps1` 从官方 release 拉 `clumsy-0.3-win64-a.zip` 到 `dist/MuMuNetSim/clumsy/`（延迟引擎用它的 WinDivert 2.2），并校验参数；
-- `third_party/clumsy` 是 `jagt/clumsy` 的 git submodule。
+- `src/MuMuNetSim.cs` 由系统自带 `csc.exe`（.NET Framework 4.x）编译，构建时写入版本信息与图标；
+- `tools/get-clumsy.ps1` 拉官方 clumsy 0.3 发行版（含 WinDivert 2.2）到 `dist\MuMuNetSim\clumsy`，并校验依赖的命令行参数；
+- `tools/get-adb.ps1` 拉官方 platform-tools 到 `third_party\adb`（腾讯镜像优先 → Google 兜底 → 回退本机 Android SDK / AdbTools / MuMu 自带）；
+- `third_party/clumsy` 是 `jagt/clumsy` 的 git submodule；`third_party/adb` 不入库（见 `.gitignore`），构建时按需下载。
 
 ## 命令行 / 自动化
 

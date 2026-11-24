@@ -98,27 +98,90 @@ function Get-ClumsyAssets([string]$Dest) {
     }
 }
 
+function Get-AdbAssets {
+    $dest = Join-Path $root 'third_party\adb'
+    & (Join-Path $root 'tools\get-adb.ps1') -Dest $dest
+    foreach ($f in @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')) {
+        if (-not (Test-Path (Join-Path $dest $f))) { throw "缺少 $f（$dest）" }
+    }
+    return $dest
+}
+
+# 第三方组件许可（随包分发，必须保留）
+$thirdPartyText = @'
+本程序（MuMuNetSim）自身：MIT License，见仓库 LICENSE。
+
+随包分发的第三方组件
+--------------------
+1) clumsy 0.3
+   https://github.com/jagt/clumsy
+   MIT License, Copyright (c) 2013-2023 James Chen (jagt)
+   用途：全局弱网（clumsy.exe）；本程序的每实例延迟引擎复用其中的 WinDivert。
+   文件：clumsy\clumsy.exe、clumsy\config.txt、clumsy\License.txt
+
+2) WinDivert 2.2
+   https://github.com/basil00/Divert
+   LGPL v3 / GPL v2 双许可
+   用途：宿主侧抓包/延迟引擎（WinDivert.dll 提供 API，WinDivert64.sys 为内核驱动，
+        首次以管理员身份开启延迟时由 WinDivert.dll 自动安装为服务）。
+   文件：clumsy\WinDivert.dll、clumsy\WinDivert64.sys
+
+3) Android platform-tools (adb)
+   https://developer.android.com/tools/releases/platform-tools
+   Apache License 2.0（Android SDK Terms）
+   用途：手机页 adb over TCP 连接与调试授权。为 Google 官方 platform-tools 的原样副本。
+   文件：adb\adb.exe、adb\AdbWinApi.dll、adb\AdbWinUsbApi.dll
+'@
+
+# 生成 exe 图标（借用 clumsy 的图标，避免仓库里再放一份二进制）
+$iconPath = Join-Path $env:TEMP 'mumunetsim_build.ico'
+function Get-IconArgs {
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $clumsyExe = Join-Path $dist 'clumsy\clumsy.exe'
+        if (Test-Path $clumsyExe) {
+            $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($clumsyExe)
+            if ($ic) {
+                $fs = [System.IO.File]::Create($iconPath)
+                $ic.Save($fs)
+                $fs.Close()
+                return @("/win32icon:$iconPath")
+            }
+        }
+    }
+    catch { Write-Warning "图标生成失败（不影响功能）：$($_.Exception.Message)" }
+    return @()
+}
+
 # ---------------------------------------------------------------- 单文件版
 if ($Single) {
-    Write-Host "[单文件版] 准备内置资产"
+    Write-Host "[单文件版] 准备内置资产（clumsy + WinDivert + adb + 文档）"
     $assetSrc = Join-Path $dist 'clumsy'
     Get-ClumsyAssets $assetSrc
+    $adbSrc = Get-AdbAssets
     $readmeTmp = Join-Path $env:TEMP ('mumunetsim_readme_' + [guid]::NewGuid().ToString('N') + '.txt')
     Set-Content -Path $readmeTmp -Value $readmeText -Encoding UTF8
+    $tpTmp = Join-Path $env:TEMP ('mumunetsim_thirdparty_' + [guid]::NewGuid().ToString('N') + '.txt')
+    Set-Content -Path $tpTmp -Value $thirdPartyText -Encoding UTF8
 
     New-Item -ItemType Directory -Force -Path $singleDir | Out-Null
     if (Test-Path $singleExe) { Remove-Item $singleExe -Force }
     Write-Host "[单文件版] 编译 $singleExe"
+    $iconArgs = Get-IconArgs
     & $csc /nologo /codepage:65001 /target:winexe /optimize+ "/out:$singleExe" `
         /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll `
         "/resource:$assetSrc\clumsy.exe,asset.clumsy.exe" `
         "/resource:$assetSrc\WinDivert.dll,asset.WinDivert.dll" `
         "/resource:$assetSrc\WinDivert64.sys,asset.WinDivert64.sys" `
         "/resource:$assetSrc\config.txt,asset.config.txt" `
-        "/resource:$assetSrc\License.txt,asset.License.txt" `
+        "/resource:$assetSrc\License.txt,asset.clumsy-license.txt" `
+        "/resource:$adbSrc\adb.exe,asset.adb.exe" `
+        "/resource:$adbSrc\AdbWinApi.dll,asset.AdbWinApi.dll" `
+        "/resource:$adbSrc\AdbWinUsbApi.dll,asset.AdbWinUsbApi.dll" `
+        "/resource:$tpTmp,asset.thirdparty.txt" `
         "/resource:$readmeTmp,asset.readme.txt" `
-        $src
-    Remove-Item $readmeTmp -Force -ErrorAction SilentlyContinue
+        $iconArgs $src
+    Remove-Item $readmeTmp, $tpTmp -Force -ErrorAction SilentlyContinue
     if ($LASTEXITCODE -ne 0) { throw "编译失败（exit $LASTEXITCODE）" }
     $size = [math]::Round((Get-Item $singleExe).Length / 1KB, 1)
     Write-Host "      -> $singleExe  $size KB"
@@ -136,23 +199,32 @@ if ($Single) {
 
 # ---------------------------------------------------------------- 目录版
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-Write-Host "[1/3] 编译 $src"
-& $csc /nologo /codepage:65001 /target:winexe /optimize+ "/out:$outExe" /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll $src
-if ($LASTEXITCODE -ne 0) { throw "编译失败（exit $LASTEXITCODE）" }
-Write-Host ("      -> " + $outExe + "  " + (Get-Item $outExe).Length + " bytes")
 
 if (-not $SkipClumsy) {
-    Write-Host "[2/3] 组装 clumsy"
+    Write-Host "[1/4] 组装 clumsy + adb"
     $cargs = @{ Dest = (Join-Path $dist 'clumsy') }
     if ($ForceClumsy) { $cargs['Force'] = $true }
     & (Join-Path $root 'tools\get-clumsy.ps1') @cargs
+    $adbSrc = Get-AdbAssets
+    $adbDst = Join-Path $dist 'adb'
+    New-Item -ItemType Directory -Force -Path $adbDst | Out-Null
+    Copy-Item (Join-Path $adbSrc 'adb.exe') $adbDst -Force
+    Copy-Item (Join-Path $adbSrc 'AdbWinApi.dll') $adbDst -Force
+    Copy-Item (Join-Path $adbSrc 'AdbWinUsbApi.dll') $adbDst -Force
 }
 else {
-    Write-Host "[2/3] 跳过 clumsy（-SkipClumsy）"
+    Write-Host "[1/4] 跳过 clumsy/adb（-SkipClumsy）"
 }
 
-Write-Host '[3/3] 生成使用说明'
+Write-Host "[2/4] 编译 $src"
+$iconArgs = Get-IconArgs
+& $csc /nologo /codepage:65001 /target:winexe /optimize+ "/out:$outExe" /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll $iconArgs $src
+if ($LASTEXITCODE -ne 0) { throw "编译失败（exit $LASTEXITCODE）" }
+Write-Host ("      -> " + $outExe + "  " + (Get-Item $outExe).Length + " bytes")
+
+Write-Host '[3/4] 生成使用说明与第三方许可'
 Set-Content -Path (Join-Path $dist '使用说明.txt') -Value $readmeText -Encoding UTF8
+Set-Content -Path (Join-Path $dist '第三方组件与许可.txt') -Value $thirdPartyText -Encoding UTF8
 
 if ($Package) {
     Write-Host "[4/4] 打包发布 zip（不含本机 MuMuNetSim.ini）"
@@ -161,7 +233,9 @@ if ($Package) {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item $outExe $stage -Force
     Copy-Item (Join-Path $dist '使用说明.txt') $stage -Force
+    Copy-Item (Join-Path $dist '第三方组件与许可.txt') $stage -Force
     Copy-Item (Join-Path $dist 'clumsy') (Join-Path $stage 'clumsy') -Recurse -Force
+    if (Test-Path (Join-Path $dist 'adb')) { Copy-Item (Join-Path $dist 'adb') (Join-Path $stage 'adb') -Recurse -Force }
     $zip = Join-Path $root ('dist\MuMuNetSim-' + $ver + '.zip')
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
     Compress-Archive -Path $stage -DestinationPath $zip -CompressionLevel Optimal
